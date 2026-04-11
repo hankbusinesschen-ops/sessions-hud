@@ -48,6 +48,23 @@ final class AppModel: ObservableObject {
         return d
     }()
 
+    /// Distinct git-repo roots currently in use by any live session, ordered
+    /// by most-recently-active first. Used as quick-pick in the launcher
+    /// popover. Sessions whose cwd isn't inside a git repo are skipped —
+    /// the launcher falls back to NSOpenPanel for those.
+    var recentProjectRoots: [String] {
+        let sorted = sessions.sorted { $0.lastEventAt > $1.lastEventAt }
+        var seen: Set<String> = []
+        var out: [String] = []
+        for s in sorted {
+            guard let root = RepoRoot.absolutePath(for: s.cwd) else { continue }
+            if seen.insert(root).inserted {
+                out.append(root)
+            }
+        }
+        return out
+    }
+
     func start() {
         // poll daemon every 1s
         pollTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
@@ -126,6 +143,33 @@ final class AppModel: ObservableObject {
         } catch {
             self.injectStatus = "inject error: \(error.localizedDescription)"
         }
+    }
+
+    /// Respond to a fixed 3-choice prompt (Permission / PlanApproval) by
+    /// injecting the numeric shortcut + CR. `choice` is 1-based: 1=Yes,
+    /// 2=Yes-always (or 2nd plan mode), 3=No (or 3rd plan mode).
+    func respondToPrompt(id: String, choice: Int) async {
+        guard (1...9).contains(choice) else { return }
+        await injectInput(sessionId: id, text: "\(choice)\r")
+    }
+
+    /// Answer an AskUserQuestion by sending the selected option labels as
+    /// free text. For single-select: one label. For multi-select: labels
+    /// joined by ", ". Falls back via `submitFreeText` if the user typed
+    /// something custom.
+    func answerQuestion(id: String, selections: [String]) async {
+        guard !selections.isEmpty else { return }
+        let joined = selections.joined(separator: ", ")
+        await injectInput(sessionId: id, text: "\(joined)\r")
+    }
+
+    /// Send arbitrary free-text as the answer to whatever prompt is live.
+    /// Used both by the AskUserQuestion "Other" field and by generic
+    /// elicitation dialogs where we only have a raw message.
+    func submitFreeText(id: String, text: String) async {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        await injectInput(sessionId: id, text: "\(trimmed)\r")
     }
 
     /// SIGTERM the wrapper process backing `sessionId`. Daemon escalates to

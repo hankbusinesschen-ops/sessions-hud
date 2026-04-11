@@ -22,6 +22,7 @@ struct SessionListView: View {
 
 struct CompactListView: View {
     @EnvironmentObject var model: AppModel
+    @State private var showLauncher: Bool = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -52,6 +53,19 @@ struct CompactListView: View {
                 .font(.system(size: 11))
                 .foregroundStyle(.tertiary)
             Spacer()
+            Button {
+                showLauncher = true
+            } label: {
+                Image(systemName: "plus.circle.fill")
+                    .font(.system(size: 13))
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .help("Launch new session")
+            .popover(isPresented: $showLauncher, arrowEdge: .top) {
+                LauncherPopover(isPresented: $showLauncher)
+                    .environmentObject(model)
+            }
             Button {
                 NSApp.terminate(nil)
             } label: {
@@ -179,7 +193,7 @@ struct SessionGroup {
     static func group(_ sessions: [SessionSummary]) -> [SessionGroup] {
         var buckets: [(String, [SessionSummary])] = []
         for s in sessions {
-            let key = repoRoot(for: s.cwd)
+            let key = RepoRoot.label(for: s.cwd)
             if let idx = buckets.firstIndex(where: { $0.0 == key }) {
                 buckets[idx].1.append(s)
             } else {
@@ -187,22 +201,6 @@ struct SessionGroup {
             }
         }
         return buckets.map { SessionGroup(label: $0.0, sessions: $0.1) }
-    }
-
-    private static func repoRoot(for cwd: String?) -> String {
-        guard let cwd, !cwd.isEmpty else { return "~" }
-        let fm = FileManager.default
-        var dir = URL(fileURLWithPath: cwd)
-        while dir.path != "/" {
-            let git = dir.appendingPathComponent(".git").path
-            if fm.fileExists(atPath: git) {
-                return dir.lastPathComponent
-            }
-            let parent = dir.deletingLastPathComponent()
-            if parent.path == dir.path { break }
-            dir = parent
-        }
-        return URL(fileURLWithPath: cwd).lastPathComponent
     }
 }
 
@@ -227,6 +225,9 @@ struct SessionRow: View {
                         .foregroundStyle(.tertiary)
                         .lineLimit(1)
                         .truncationMode(.head)
+                }
+                if let stats = session.stats, stats.hasAnyPct || stats.modelDisplay != nil {
+                    StatsLine(stats: stats, fontSize: 9)
                 }
             }
             Spacer(minLength: 4)
@@ -257,6 +258,16 @@ struct SessionRow: View {
     }
 
     private var rightLabel: String {
+        // If there's a structured prompt, prefer it — tells the user *what*
+        // is blocking rather than just "needs OK".
+        if let prompt = session.pendingPrompt {
+            switch prompt {
+            case .permission(let m):      return promptShort(m)
+            case .planApproval:           return "plan approval"
+            case .question:               return "question"
+            case .raw:                    return "prompt"
+            }
+        }
         switch session.status {
         case .running, .idle:
             return "⏱ \(formatElapsed(now.timeIntervalSince(session.lastEventAt)))"
@@ -269,6 +280,16 @@ struct SessionRow: View {
         case .unknown:
             return ""
         }
+    }
+
+    /// Reduce "Claude needs your permission to use Bash" → "needs Bash".
+    private func promptShort(_ message: String) -> String {
+        if let range = message.range(of: "to use ") {
+            let tool = message[range.upperBound...]
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return "needs \(tool)"
+        }
+        return "needs OK"
     }
 
     private func formatElapsed(_ seconds: TimeInterval) -> String {
@@ -302,6 +323,15 @@ struct ChatView: View {
         VStack(spacing: 0) {
             header
             Divider().opacity(0.3)
+            if let prompt = selectedSummary?.pendingPrompt, let sid = model.selectedId {
+                PromptBanner(
+                    prompt: prompt,
+                    sessionId: sid,
+                    canInject: canInject
+                )
+                .environmentObject(model)
+                Divider().opacity(0.3)
+            }
             messageList
             Divider().opacity(0.3)
             injectBar
@@ -349,9 +379,14 @@ struct ChatView: View {
 
             Spacer()
 
-            Text(selectedSummary?.status.label ?? "")
-                .font(.system(size: 10, design: .monospaced))
-                .foregroundStyle(.secondary)
+            VStack(alignment: .trailing, spacing: 2) {
+                Text(selectedSummary?.status.label ?? "")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                if let stats = selectedSummary?.stats, stats.hasAnyPct || stats.modelDisplay != nil {
+                    StatsLine(stats: stats, fontSize: 10)
+                }
+            }
 
             Button {
                 TerminalFocus.openInTerminal(
@@ -587,5 +622,431 @@ struct MessageBubble: View {
         case "assistant": return Color.purple.opacity(0.08)
         default:          return Color.gray.opacity(0.08)
         }
+    }
+}
+
+// MARK: - Prompt banner
+
+/// Yellow-tinted banner surfaced above the chat when Claude Code is blocked
+/// on an interactive prompt. Renders differently based on the PendingPrompt
+/// variant; all routes ultimately POST to /sessions/:id/input via AppModel.
+struct PromptBanner: View {
+    @EnvironmentObject var model: AppModel
+    let prompt: PendingPrompt
+    let sessionId: String
+    let canInject: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            switch prompt {
+            case .permission(let message):
+                permissionView(message: message)
+            case .planApproval(let message):
+                planApprovalView(message: message)
+            case .question(_, let questions):
+                // Render the first outstanding question. When claude chains
+                // follow-ups, the daemon replaces `pending_prompt` and this
+                // view refreshes automatically.
+                if let q = questions.first {
+                    QuestionView(
+                        question: q,
+                        sessionId: sessionId,
+                        canInject: canInject
+                    )
+                    .environmentObject(model)
+                }
+            case .raw(let message):
+                rawView(message: message)
+            }
+            if !canInject {
+                Text("read-only — answer in terminal (launch via ccw to enable)")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.yellow.opacity(0.12))
+    }
+
+    @ViewBuilder
+    private func permissionView(message: String) -> some View {
+        HStack(alignment: .top, spacing: 6) {
+            Text("⚠")
+            Text(message.isEmpty ? "Claude needs your permission" : message)
+                .font(.system(size: 12, weight: .medium))
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        HStack(spacing: 6) {
+            Button("Yes") { respond(1) }
+            Button("Yes, don't ask again") { respond(2) }
+            Button("No") { respond(3) }
+        }
+        .disabled(!canInject)
+    }
+
+    @ViewBuilder
+    private func planApprovalView(message: String) -> some View {
+        HStack(alignment: .top, spacing: 6) {
+            Text("📋")
+            Text(message.isEmpty ? "Claude needs approval for the plan" : message)
+                .font(.system(size: 12, weight: .medium))
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        HStack(spacing: 6) {
+            Button("Yes, auto-accept edits") { respond(1) }
+            Button("Yes, approve each edit") { respond(2) }
+            Button("No, keep planning") { respond(3) }
+        }
+        .disabled(!canInject)
+    }
+
+    @ViewBuilder
+    private func rawView(message: String) -> some View {
+        HStack(alignment: .top, spacing: 6) {
+            Text("❓")
+            Text(message.isEmpty ? "Claude is waiting for input" : message)
+                .font(.system(size: 12))
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func respond(_ choice: Int) {
+        Task { await model.respondToPrompt(id: sessionId, choice: choice) }
+    }
+}
+
+/// Renders a single AskUserQuestion — radio for single-select, checkbox for
+/// multi-select, plus a free-text "Other" field. v1 injects the selected
+/// labels as plain text (see plan Layer 3 note on label-text path).
+struct QuestionView: View {
+    @EnvironmentObject var model: AppModel
+    let question: AskQuestion
+    let sessionId: String
+    let canInject: Bool
+
+    @State private var selected: Set<String> = []
+    @State private var freeText: String = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top, spacing: 6) {
+                Text("❓")
+                VStack(alignment: .leading, spacing: 2) {
+                    if !question.header.isEmpty {
+                        Text(question.header)
+                            .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                    }
+                    Text(question.question)
+                        .font(.system(size: 12, weight: .medium))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            VStack(alignment: .leading, spacing: 4) {
+                ForEach(question.options, id: \.label) { opt in
+                    optionRow(opt)
+                }
+            }
+            HStack(spacing: 6) {
+                TextField("or type your answer…", text: $freeText)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 11))
+                    .disabled(!canInject)
+                Button("Submit") { submit() }
+                    .font(.system(size: 11))
+                    .disabled(!canInject || (selected.isEmpty && freeText.isEmpty))
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func optionRow(_ opt: AskOption) -> some View {
+        Button {
+            toggle(opt.label)
+        } label: {
+            HStack(alignment: .top, spacing: 6) {
+                Image(systemName: iconName(for: opt.label))
+                    .font(.system(size: 11))
+                    .foregroundStyle(selected.contains(opt.label) ? Color.accentColor : .secondary)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(opt.label)
+                        .font(.system(size: 12, weight: .medium))
+                    if !opt.description.isEmpty {
+                        Text(opt.description)
+                            .font(.system(size: 10))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.vertical, 3)
+            .padding(.horizontal, 4)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(!canInject)
+    }
+
+    private func iconName(for label: String) -> String {
+        let on = selected.contains(label)
+        if question.multiSelect {
+            return on ? "checkmark.square.fill" : "square"
+        } else {
+            return on ? "largecircle.fill.circle" : "circle"
+        }
+    }
+
+    private func toggle(_ label: String) {
+        if question.multiSelect {
+            if selected.contains(label) {
+                selected.remove(label)
+            } else {
+                selected.insert(label)
+            }
+        } else {
+            // Single-select: one tap sends immediately.
+            selected = [label]
+            Task {
+                await model.answerQuestion(id: sessionId, selections: [label])
+                await MainActor.run {
+                    self.selected.removeAll()
+                    self.freeText = ""
+                }
+            }
+        }
+    }
+
+    private func submit() {
+        let text = freeText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let sid = sessionId
+        let selections = Array(selected)
+        let free = text
+        Task {
+            if !free.isEmpty {
+                await model.submitFreeText(id: sid, text: free)
+            } else if !selections.isEmpty {
+                await model.answerQuestion(id: sid, selections: selections)
+            }
+            await MainActor.run {
+                self.selected.removeAll()
+                self.freeText = ""
+            }
+        }
+    }
+}
+
+// MARK: - Stats line
+
+/// Renders Claude Code quota snapshot (model · ctx% · 5h% · 7d%) as a
+/// horizontal strip with per-segment threshold coloring. Used in both Mode A
+/// row third line and Mode B header.
+struct StatsLine: View {
+    let stats: SessionStats
+    let fontSize: CGFloat
+
+    var body: some View {
+        HStack(spacing: 6) {
+            if let m = stats.modelDisplay {
+                Text(m).foregroundStyle(.secondary)
+            }
+            if let p = stats.ctxPct {
+                Text("ctx \(Int(p.rounded()))%").foregroundStyle(Self.color(for: p))
+            }
+            if let p = stats.fiveHrPct {
+                Text("5h \(Int(p.rounded()))%").foregroundStyle(Self.color(for: p))
+            }
+            if let p = stats.sevenDayPct {
+                Text("7d \(Int(p.rounded()))%").foregroundStyle(Self.color(for: p))
+            }
+        }
+        .font(.system(size: fontSize, design: .monospaced))
+        .lineLimit(1)
+        .help(tooltip)
+    }
+
+    private var tooltip: String {
+        let df = DateFormatter()
+        df.dateStyle = .none
+        df.timeStyle = .medium
+        return "updated \(df.string(from: stats.updatedAt))"
+    }
+
+    static func color(for pct: Float) -> Color {
+        if pct >= 80 { return .red }
+        if pct >= 60 { return .orange }
+        return .secondary
+    }
+}
+
+extension SessionStats {
+    var hasAnyPct: Bool {
+        ctxPct != nil || fiveHrPct != nil || sevenDayPct != nil
+    }
+}
+
+// MARK: - Launcher popover
+
+/// Popover for spawning a new ccw/cxw session. Delegates the actual spawn to
+/// TerminalFocus.launchNewSession, which asks Terminal.app (or iTerm2) to
+/// open a new window running `cd <cwd> && ccw <name>`. The HUD picks up the
+/// new session on the next 1s poll via sessionsd /register.
+struct LauncherPopover: View {
+    @EnvironmentObject var model: AppModel
+    @Binding var isPresented: Bool
+
+    @State private var flavor: WrapperFlavor = .ccw
+    @State private var mode: PermissionMode = .defaultMode
+    @State private var name: String = ""
+    @State private var cwd: String = ""
+    @State private var errorMessage: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("New session")
+                .font(.system(size: 13, weight: .semibold))
+
+            Picker("Flavor", selection: $flavor) {
+                ForEach(WrapperFlavor.allCases) { f in
+                    Text(f.label).tag(f)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+
+            if flavor == .ccw {
+                Picker("Mode", selection: $mode) {
+                    ForEach(PermissionMode.allCases) { m in
+                        Text(m.label).tag(m)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+            }
+
+            HStack(spacing: 6) {
+                Text("Name")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 40, alignment: .leading)
+                TextField("session name", text: $name)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 12))
+            }
+
+            HStack(spacing: 6) {
+                Text("Dir")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 40, alignment: .leading)
+                Text(cwd.isEmpty ? "— pick below —" : shortenedPath(cwd))
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(cwd.isEmpty ? .tertiary : .primary)
+                    .lineLimit(1)
+                    .truncationMode(.head)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            if !model.recentProjectRoots.isEmpty {
+                Text("Recent")
+                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+                VStack(alignment: .leading, spacing: 2) {
+                    ForEach(model.recentProjectRoots.prefix(6), id: \.self) { root in
+                        Button {
+                            selectCwd(root)
+                        } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: cwd == root ? "largecircle.fill.circle" : "circle")
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(cwd == root ? Color.accentColor : .secondary)
+                                Text(shortenedPath(root))
+                                    .font(.system(size: 11, design: .monospaced))
+                                    .lineLimit(1)
+                                    .truncationMode(.head)
+                                Spacer(minLength: 0)
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+
+            Button("Choose directory…") { chooseDirectory() }
+                .font(.system(size: 11))
+
+            if let err = errorMessage {
+                Text(err)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.red)
+                    .lineLimit(2)
+            }
+
+            HStack {
+                Spacer()
+                Button("Cancel") { isPresented = false }
+                    .keyboardShortcut(.cancelAction)
+                Button("Launch") { launch() }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(!canLaunch)
+            }
+        }
+        .padding(14)
+        .frame(width: 360)
+    }
+
+    private var canLaunch: Bool {
+        !name.trimmingCharacters(in: .whitespaces).isEmpty &&
+        !cwd.isEmpty
+    }
+
+    /// Treat name as "auto-following cwd" when it matches the previous cwd's
+    /// basename (or is blank). Once the user types something custom we leave
+    /// it alone even across Recent reselects.
+    private func selectCwd(_ path: String) {
+        let previousAutoName = cwd.isEmpty ? "" : URL(fileURLWithPath: cwd).lastPathComponent
+        let nameIsAuto = name.isEmpty || name == previousAutoName
+        cwd = path
+        if nameIsAuto {
+            name = URL(fileURLWithPath: path).lastPathComponent
+        }
+    }
+
+    private func chooseDirectory() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Select"
+        if panel.runModal() == .OK, let url = panel.url {
+            selectCwd(url.path)
+        }
+    }
+
+    private func launch() {
+        let trimmedName = name.trimmingCharacters(in: .whitespaces)
+        guard !trimmedName.isEmpty, !cwd.isEmpty else { return }
+        if let err = TerminalFocus.launchNewSession(
+            flavor: flavor,
+            mode: mode,
+            name: trimmedName,
+            cwd: cwd
+        ) {
+            errorMessage = "launch failed: \(err)"
+            return
+        }
+        isPresented = false
+    }
+
+    private func shortenedPath(_ path: String) -> String {
+        let home = NSHomeDirectory()
+        if path.hasPrefix(home) {
+            return "~" + path.dropFirst(home.count)
+        }
+        return path
     }
 }
