@@ -20,6 +20,33 @@ struct SessionSummary: Codable, Identifiable, Equatable {
     }
 }
 
+/// Full session payload returned by `GET /sessions/:id`. Mirrors the daemon's
+/// `Session` struct, minus the `#[serde(skip)]` fields.
+struct SessionDetail: Codable, Equatable {
+    let id: String
+    let name: String
+    let status: SessionSummary.Status
+    let cwd: String?
+    let transcriptPath: String?
+    let startedAt: Date
+    let lastEventAt: Date
+    let messages: [SessionMessage]
+    let wrapperId: String?
+}
+
+struct SessionMessage: Codable, Equatable, Identifiable {
+    let role: String
+    let kind: String       // "text" | "tool_use" | "tool_result"
+    let text: String
+    let timestamp: String?
+
+    /// Stable enough for ForEach: (timestamp, role, text-hash). Messages are
+    /// append-only in the daemon, so collisions are effectively impossible.
+    var id: String {
+        "\(timestamp ?? "")|\(role)|\(kind)|\(text.count)|\(text.hashValue)"
+    }
+}
+
 extension SessionSummary.Status {
     var icon: String {
         switch self {
