@@ -83,20 +83,25 @@ struct CompactListView: View {
                     ForEach(groupedSessions, id: \.label) { group in
                         Section {
                             ForEach(group.sessions) { session in
-                                SessionRow(session: session, now: model.now, selected: false)
-                                    .contentShape(Rectangle())
-                                    .onTapGesture {
-                                        model.selectedId = session.id
+                                SessionRow(
+                                    session: session,
+                                    now: model.now,
+                                    selected: false,
+                                    onClose: { confirmAndClose(session) }
+                                )
+                                .contentShape(Rectangle())
+                                .onTapGesture {
+                                    model.selectedId = session.id
+                                }
+                                .contextMenu {
+                                    Button("Forget session") {
+                                        Task { await model.forgetSession(id: session.id) }
                                     }
-                                    .contextMenu {
-                                        Button("Forget session") {
-                                            Task { await model.forgetSession(id: session.id) }
-                                        }
-                                        Button("Terminate (SIGTERM)") {
-                                            confirmAndTerminate(session)
-                                        }
-                                        .disabled(session.wrapperId == nil)
+                                    Button("Terminate (SIGTERM)") {
+                                        confirmAndTerminate(session)
                                     }
+                                    .disabled(session.wrapperId == nil)
+                                }
                                 Divider().opacity(0.15)
                             }
                         } header: {
@@ -122,6 +127,31 @@ struct CompactListView: View {
 
     private var groupedSessions: [SessionGroup] {
         SessionGroup.group(model.sessions)
+    }
+
+    /// Row-level close button: picks terminate vs forget based on whether
+    /// the session has a wrapper, and confirms first.
+    private func confirmAndClose(_ session: SessionSummary) {
+        let alert = NSAlert()
+        if session.wrapperId != nil {
+            alert.messageText = "Terminate “\(session.name)”?"
+            alert.informativeText = "Sends SIGTERM to the ccw/cxw wrapper. Daemon escalates to SIGKILL after 3 seconds."
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "Terminate")
+            alert.addButton(withTitle: "Cancel")
+            if alert.runModal() == .alertFirstButtonReturn {
+                Task { await model.terminateSession(id: session.id) }
+            }
+        } else {
+            alert.messageText = "Forget “\(session.name)”?"
+            alert.informativeText = "Removes this session from the HUD list. The underlying claude process keeps running."
+            alert.alertStyle = .informational
+            alert.addButton(withTitle: "Forget")
+            alert.addButton(withTitle: "Cancel")
+            if alert.runModal() == .alertFirstButtonReturn {
+                Task { await model.forgetSession(id: session.id) }
+            }
+        }
     }
 
     private func confirmAndTerminate(_ session: SessionSummary) {
@@ -180,6 +210,7 @@ struct SessionRow: View {
     let session: SessionSummary
     let now: Date
     let selected: Bool
+    var onClose: (() -> Void)? = nil
 
     var body: some View {
         HStack(spacing: 8) {
@@ -208,6 +239,17 @@ struct SessionRow: View {
             Text(rightLabel)
                 .font(.system(size: 10, design: .monospaced))
                 .foregroundStyle(.secondary)
+            if let onClose {
+                Button(action: onClose) {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help(session.wrapperId != nil
+                      ? "Terminate (SIGTERM wrapper)"
+                      : "Forget session (remove from list)")
+            }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
