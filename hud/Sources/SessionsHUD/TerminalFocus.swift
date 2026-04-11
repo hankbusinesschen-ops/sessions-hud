@@ -68,6 +68,20 @@ enum TerminalFocus {
         """
     }
 
+    /// Fire a no-op AppleScript once at first launch so macOS prompts for
+    /// Automation consent up-front instead of silently failing the first time
+    /// the user clicks `+` → Launch. We target Terminal.app because it is
+    /// preinstalled on every Mac — iTerm users will still see a second
+    /// prompt the first time they launch into iTerm, which is acceptable.
+    static func primeAutomationPermission() {
+        let script = """
+        tell application "Terminal"
+            count windows
+        end tell
+        """
+        _ = runReturningError(script)
+    }
+
     // MARK: - Launch new session
 
     /// Spawns a new wrapper session by asking Terminal.app (or iTerm2 when

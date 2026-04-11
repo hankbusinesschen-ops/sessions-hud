@@ -80,11 +80,15 @@ To remove everything:
 
 ## Post-install setup
 
-`install.sh` installs the binaries and the launchd daemon, but three more
-pieces have to be wired up by hand. None of them are optional if you want
-the full experience.
+`install.sh` now wires up most things automatically:
 
-### 1. Add `~/.local/bin` to your PATH
+- **Claude Code hooks** — idempotently merged into `~/.claude/settings.json` by `packaging/merge-hooks.sh`. If you already have other hooks, they're preserved.
+- **Statusline tee** — if `~/.claude/statusline-command.sh` exists, the ctx%/5h%/7d% tee snippet is injected right after `input=$(cat)`. Skipped cleanly if you already pasted it manually or don't run a custom statusline.
+- **Automation permission** — the HUD triggers macOS's Automation consent dialog on first launch so you approve it up-front instead of hitting a silent failure the first time you click `+` → Launch.
+
+The only step you may still need to do manually:
+
+### Add `~/.local/bin` to your PATH
 
 If `install.sh` warned you about this, add it to `~/.zshrc`:
 
@@ -94,53 +98,7 @@ export PATH="$HOME/.local/bin:$PATH"
 
 Then open a new terminal or `source ~/.zshrc`.
 
-### 2. Wire up Claude Code hooks (required for live session tracking)
-
-The daemon learns about sessions from Claude Code's hook system. Open
-`~/.claude/settings.json` and merge in the following block. **Replace
-`/PATH/TO/sessions-hud`** with the absolute path to your clone (e.g.
-`/Users/you/code/sessions-hud`).
-
-```json
-{
-  "hooks": {
-    "SessionStart":     [{ "hooks": [{ "type": "command", "command": "/PATH/TO/sessions-hud/hooks/post-event.sh SessionStart" }] }],
-    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "/PATH/TO/sessions-hud/hooks/post-event.sh UserPromptSubmit" }] }],
-    "Notification":     [{ "hooks": [{ "type": "command", "command": "/PATH/TO/sessions-hud/hooks/post-event.sh Notification" }] }],
-    "Stop":             [{ "hooks": [{ "type": "command", "command": "/PATH/TO/sessions-hud/hooks/post-event.sh Stop" }] }]
-  }
-}
-```
-
-Each hook POSTs a small JSON blob to `http://127.0.0.1:39501/hook/<event>`.
-The script is fire-and-forget — if the daemon is down, Claude Code keeps
-working and you just don't see the session in the HUD.
-
-### 3. Patch your statusline for quota display (optional but recommended)
-
-If you already use Claude Code's custom statusline (`~/.claude/statusline-command.sh`),
-paste the block below near the top of that file, right after `input=$(cat)`.
-It tees the raw statusline JSON to the daemon so the HUD can show `ctx% /
-5h% / 7d%` per session.
-
-```bash
-(printf '%s' "$input" | curl -s \
-    --max-time 0.3 --connect-timeout 0.3 \
-    -H 'Content-Type: application/json' -d @- \
-    http://127.0.0.1:39501/hook/statusline >/dev/null 2>&1) &
-```
-
-It's capped at 300ms, backgrounded, silent on failure. If sessionsd is down
-the statusline keeps working unchanged. Without this patch the HUD still
-works — quota rows just stay blank.
-
-Also available as a file: `packaging/statusline-snippet.sh`.
-
-### 4. Grant Automation permission (required for the `+` launcher)
-
-The first time you click `+` → Launch in the HUD, macOS pops up a dialog
-asking whether to allow Sessions HUD to control Terminal.app (or iTerm2).
-Click **OK**. If you mis-click Deny:
+### If you denied the Automation prompt
 
 > System Settings → Privacy & Security → Automation → Sessions HUD → enable Terminal / iTerm
 

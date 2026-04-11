@@ -32,6 +32,27 @@ uninstall() {
     for b in "${RUST_BINS[@]}" sessions-hud; do
         rm -f "$BIN_DIR/$b"
     done
+
+    echo "→ removing statusline patch (if any)"
+    if [[ -f "$HOME/.claude/statusline-command.sh" ]]; then
+        python3 - "$HOME/.claude/statusline-command.sh" <<'PY' || true
+import sys, pathlib, re
+p = pathlib.Path(sys.argv[1])
+text = p.read_text()
+pattern = re.compile(
+    r"# >>> sessions-hud statusline tee >>>.*?# <<< sessions-hud statusline tee <<<\n",
+    re.DOTALL,
+)
+new = pattern.sub("", text)
+if new != text:
+    p.write_text(new)
+    print("statusline: unpatched")
+PY
+    fi
+
+    yellow "note: hooks in ~/.claude/settings.json are not auto-removed."
+    yellow "      delete the SessionStart/UserPromptSubmit/Notification/Stop"
+    yellow "      entries that reference this repo by hand if you want them gone."
     green "uninstalled."
 }
 
@@ -84,12 +105,12 @@ case ":$PATH:" in
         ;;
 esac
 
-HOOKS_FILE="$HOME/.claude/settings.json"
-if [[ ! -f "$HOOKS_FILE" ]] || ! grep -q "sessionsd" "$HOOKS_FILE" 2>/dev/null; then
-    echo
-    yellow "⚠  Claude Code hooks not detected in $HOOKS_FILE"
-    echo "   See README for the hook snippet to paste in."
-fi
+echo
+echo "→ merging Claude Code hooks into ~/.claude/settings.json"
+"$REPO_ROOT/packaging/merge-hooks.sh" "$REPO_ROOT"
+
+echo "→ patching statusline (if present)"
+"$REPO_ROOT/packaging/patch-statusline.sh"
 
 echo
 green "ready. run 'sessions-hud' to open the HUD, 'ccw <name>' to launch a wrapped claude."
