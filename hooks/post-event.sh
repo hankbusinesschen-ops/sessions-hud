@@ -34,7 +34,7 @@ curl --silent --show-error --fail \
     --max-time 1 \
     --connect-timeout 1 \
     -H 'Content-Type: application/json' \
-    "${WRAPPER_HEADER[@]}" \
+    ${WRAPPER_HEADER[@]+"${WRAPPER_HEADER[@]}"} \
     -X POST \
     --data "$PAYLOAD" \
     "${DAEMON_URL}/hook/${EVENT}" \
