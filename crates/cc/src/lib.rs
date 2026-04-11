@@ -164,6 +164,76 @@ fn unregister_from_daemon(wrapper_id: &str) {
     let _ = agent.delete(&url).call();
 }
 
+/// Fire a synthetic Claude-Code-style hook against sessionsd. Used by `cx`
+/// because Codex CLI has no hook system of its own — the wrapper fabricates
+/// the lifecycle events the daemon expects.
+fn fire_hook(event: &str, wrapper_id: &str, session_id: &str, cwd: &str) {
+    let url = format!("{}/hook/{}", daemon_url(), event);
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_millis(500))
+        .timeout(Duration::from_millis(1000))
+        .build();
+    let body = serde_json::json!({
+        "session_id": session_id,
+        "cwd": cwd,
+        "hook_event_name": event,
+    });
+    let _ = agent
+        .post(&url)
+        .set("x-cc-wrapper-id", wrapper_id)
+        .send_json(body);
+}
+
+/// Background thread that batches PTY output from the reader and POSTs it to
+/// `/sessions/:id/output` so the daemon can strip ANSI and surface readable
+/// lines in the HUD. Only used for `cx` — `claude` writes its own JSONL
+/// transcript that the daemon tails directly.
+fn start_output_forwarder(session_id: String, rx: mpsc::Receiver<Vec<u8>>) {
+    thread::spawn(move || {
+        let url = format!("{}/sessions/{}/output", daemon_url(), session_id);
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_millis(500))
+            .timeout(Duration::from_millis(2000))
+            .build();
+        let mut buf: Vec<u8> = Vec::with_capacity(8192);
+        let flush_threshold = 4096usize;
+        let flush_interval = Duration::from_millis(300);
+
+        loop {
+            // Block for the first chunk, then drain anything queued without
+            // waiting so we batch on busy traffic.
+            let first = match rx.recv_timeout(flush_interval) {
+                Ok(b) => Some(b),
+                Err(mpsc::RecvTimeoutError::Timeout) => None,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    if !buf.is_empty() {
+                        let _ = agent.post(&url).send_bytes(&buf);
+                    }
+                    return;
+                }
+            };
+            if let Some(b) = first {
+                buf.extend_from_slice(&b);
+                while let Ok(more) = rx.try_recv() {
+                    buf.extend_from_slice(&more);
+                    if buf.len() >= flush_threshold {
+                        break;
+                    }
+                }
+            }
+            if !buf.is_empty() {
+                if agent.post(&url).send_bytes(&buf).is_ok() {
+                    buf.clear();
+                } else {
+                    // Drop the batch on failure — keeping history here would
+                    // let a dead daemon balloon memory indefinitely.
+                    buf.clear();
+                }
+            }
+        }
+    });
+}
+
 fn parse_args() -> (String, Vec<String>) {
     let mut args = std::env::args().skip(1);
     let name = args.next().unwrap_or_else(|| "unnamed".into());
@@ -175,11 +245,32 @@ fn parse_args() -> (String, Vec<String>) {
     (name, rest)
 }
 
-fn main() -> Result<()> {
+/// Kind of CLI we're wrapping. Determines default target program, whether we
+/// fire synthetic hooks (Codex has none natively), and whether we tee the
+/// PTY output stream to the daemon for ANSI-stripped message capture.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Flavor {
+    Claude,
+    Codex,
+}
+
+impl Flavor {
+    fn default_target(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+        }
+    }
+}
+
+/// Entry point shared by both the `cc` and `cx` binaries. The flavor controls
+/// default target and which lifecycle plumbing we attach.
+pub fn run(flavor: Flavor) -> Result<()> {
     let (name, extra_args) = parse_args();
 
     // Resolve target program. Override with $CC_WRAPPER_TARGET for testing.
-    let target = std::env::var("CC_WRAPPER_TARGET").unwrap_or_else(|_| "claude".to_string());
+    let target = std::env::var("CC_WRAPPER_TARGET")
+        .unwrap_or_else(|_| flavor.default_target().to_string());
 
     // Register with sessionsd so the HUD can show the user-chosen name
     // instead of the cwd basename. Soft-fails if the daemon is down.
@@ -188,6 +279,21 @@ fn main() -> Result<()> {
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default();
     let registration = register_with_daemon(&name, &cwd_str);
+
+    // Codex has no hook system, so `cx` fabricates a session id + SessionStart
+    // event for the daemon. We keep it alive by firing Stop on exit. The
+    // session_id is a UUID that lives only as long as this wrapper instance.
+    let synthetic_session_id = if flavor == Flavor::Codex {
+        if let Some(ref reg) = registration {
+            let sid = uuid::Uuid::new_v4().to_string();
+            fire_hook("SessionStart", &reg.wrapper_id, &sid, &cwd_str);
+            Some(sid)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     // Detect host terminal size; fall back to 80x24 if we're not on a tty.
     let (cols, rows) = terminal::size().unwrap_or((80, 24));
@@ -215,7 +321,7 @@ fn main() -> Result<()> {
     //   - CC_NO_SKIP_PERMISSIONS=1
     //   - non-claude target (bash / cat / codex stubs for testing)
     {
-        let is_claude = target == "claude";
+        let is_claude = flavor == Flavor::Claude && target == "claude";
         let user_has_flag = extra_args.iter().any(|a| a == "--dangerously-skip-permissions");
         let opt_out = std::env::var("CC_NO_SKIP_PERMISSIONS").ok().as_deref() == Some("1");
         if is_claude && !user_has_flag && !opt_out {
@@ -280,23 +386,43 @@ fn main() -> Result<()> {
     // keystrokes flow through verbatim (Ctrl-C becomes 0x03 in stdin, etc.).
     let _raw = RawModeGuard::enable_if_tty()?;
 
-    // Thread: pty master → stdout
-    let out_thread = thread::spawn(move || {
-        let mut buf = [0u8; 4096];
-        let mut stdout = std::io::stdout();
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    if stdout.write_all(&buf[..n]).is_err() {
-                        break;
-                    }
-                    let _ = stdout.flush();
-                }
-                Err(_) => break,
-            }
+    // Output tee: for Codex we siphon PTY master bytes to a forwarder thread
+    // that POSTs them to sessionsd for ANSI stripping + HUD display. Claude
+    // sessions skip this because the daemon already tails their JSONL
+    // transcript.
+    let output_tx: Option<mpsc::Sender<Vec<u8>>> = match (&synthetic_session_id, &registration) {
+        (Some(sid), Some(_)) => {
+            let (otx, orx) = mpsc::channel::<Vec<u8>>();
+            start_output_forwarder(sid.clone(), orx);
+            Some(otx)
         }
-    });
+        _ => None,
+    };
+
+    // Thread: pty master → stdout (+ optional tee → output forwarder)
+    let out_thread = {
+        let output_tx = output_tx.clone();
+        thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            let mut stdout = std::io::stdout();
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if stdout.write_all(&buf[..n]).is_err() {
+                            break;
+                        }
+                        let _ = stdout.flush();
+                        if let Some(ref otx) = output_tx {
+                            let _ = otx.send(buf[..n].to_vec());
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        })
+    };
+    drop(output_tx);
 
     // Thread: stdin → channel (keyboard path).
     {
@@ -349,6 +475,9 @@ fn main() -> Result<()> {
     let _ = out_thread.join();
 
     if let Some(ref reg) = registration {
+        if let Some(ref sid) = synthetic_session_id {
+            fire_hook("Stop", &reg.wrapper_id, sid, &cwd_str);
+        }
         unregister_from_daemon(&reg.wrapper_id);
         let _ = std::fs::remove_file(&reg.socket_path);
     }

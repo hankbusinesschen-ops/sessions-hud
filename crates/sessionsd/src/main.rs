@@ -1,5 +1,6 @@
 use anyhow::Result;
 use axum::{
+    body::Bytes,
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Json},
@@ -20,6 +21,9 @@ const LISTEN_ADDR: &str = "127.0.0.1:39501";
 const TAIL_INTERVAL: Duration = Duration::from_millis(500);
 const MAX_MESSAGES_PER_SESSION: usize = 500;
 const WRAPPER_PRUNE_INTERVAL: Duration = Duration::from_secs(5);
+/// Max bytes we buffer per session while waiting for a line terminator. If a
+/// Codex TUI never emits a newline we don't want to grow unbounded.
+const MAX_PARTIAL_LINE: usize = 16 * 1024;
 
 fn socket_dir() -> PathBuf {
     std::env::temp_dir().join("sessionsd")
@@ -68,6 +72,10 @@ struct Session {
     /// $TERM_PROGRAM snapshot ("Apple_Terminal", "iTerm.app", …) for routing
     /// the "Open in Terminal" AppleScript to the right app.
     term_program: Option<String>,
+    /// Unfinished tail of the last `/output` chunk, waiting for a newline.
+    /// Only populated for Codex sessions (`cx`); Claude uses transcript tail.
+    #[serde(skip)]
+    output_partial: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -102,6 +110,7 @@ impl Session {
             wrapper_id: None,
             tty: None,
             term_program: None,
+            output_partial: String::new(),
         }
     }
 }
@@ -325,6 +334,126 @@ async fn inject_by_session(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("join: {e}")))?
         .map_err(|e| (StatusCode::BAD_GATEWAY, format!("inject: {e}")))?;
     Ok(StatusCode::OK)
+}
+
+/// Strip common ANSI escape sequences so Codex TUI output becomes readable
+/// text in the HUD. We handle CSI (ESC `[` … final byte in 0x40..=0x7E),
+/// OSC (ESC `]` … BEL or ESC \\), and single-char ESC sequences. Anything
+/// unrecognized is dropped. Kept intentionally dependency-free — this is
+/// best-effort, not a spec-compliant parser.
+fn strip_ansi(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == 0x1b {
+            // ESC
+            if i + 1 >= bytes.len() {
+                break;
+            }
+            match bytes[i + 1] {
+                b'[' => {
+                    // CSI: params then a final byte in 0x40..=0x7E
+                    i += 2;
+                    while i < bytes.len() {
+                        let c = bytes[i];
+                        i += 1;
+                        if (0x40..=0x7e).contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                b']' => {
+                    // OSC: terminated by BEL (0x07) or ST (ESC \)
+                    i += 2;
+                    while i < bytes.len() {
+                        if bytes[i] == 0x07 {
+                            i += 1;
+                            break;
+                        }
+                        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
+                            i += 2;
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                _ => {
+                    // single-char escape (e.g. ESC 7 save cursor)
+                    i += 2;
+                }
+            }
+        } else if b == b'\r' {
+            // CR without LF is usually cursor-return in a TUI — drop it so
+            // repeated progress redraws don't clutter the transcript. If a
+            // CRLF appears, let the LF survive.
+            i += 1;
+        } else if b == 0x08 {
+            // Backspace — chew the previous char if we can.
+            out.pop();
+            i += 1;
+        } else {
+            out.push(b as char);
+            i += 1;
+        }
+    }
+    out
+}
+
+async fn append_output(
+    Path(session_id): Path<String>,
+    State(state): State<AppState>,
+    body: Bytes,
+) -> StatusCode {
+    let text = match std::str::from_utf8(&body) {
+        Ok(s) => s.to_string(),
+        Err(_) => String::from_utf8_lossy(&body).into_owned(),
+    };
+    let cleaned = strip_ansi(&text);
+    if cleaned.is_empty() {
+        return StatusCode::OK;
+    }
+
+    let mut reg = state.registry.write();
+    let Some(session) = reg.get_mut(&session_id) else {
+        return StatusCode::NOT_FOUND;
+    };
+
+    session.last_event_at = Utc::now();
+    session.output_partial.push_str(&cleaned);
+
+    // Split on newline; last element (if partial) stays buffered.
+    let mut lines: Vec<String> = session
+        .output_partial
+        .split('\n')
+        .map(|s| s.trim_end().to_string())
+        .collect();
+    let tail = lines.pop().unwrap_or_default();
+    session.output_partial = tail;
+    if session.output_partial.len() > MAX_PARTIAL_LINE {
+        // force-flush an over-long line so memory stays bounded
+        let forced = std::mem::take(&mut session.output_partial);
+        lines.push(forced);
+    }
+
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        session.messages.push(Message {
+            role: "assistant".into(),
+            kind: "text".into(),
+            text: line,
+            timestamp: Some(Utc::now().to_rfc3339()),
+        });
+    }
+    if session.messages.len() > MAX_MESSAGES_PER_SESSION {
+        let drop = session.messages.len() - MAX_MESSAGES_PER_SESSION;
+        session.messages.drain(0..drop);
+    }
+
+    StatusCode::OK
 }
 
 /// Debug-only injection: bypass session lookup and target a wrapper directly.
@@ -632,6 +761,7 @@ async fn main() -> Result<()> {
         .route("/sessions", get(list_sessions))
         .route("/sessions/:id", get(get_session))
         .route("/sessions/:id/input", post(inject_by_session))
+        .route("/sessions/:id/output", post(append_output))
         .route("/hook/:event", post(handle_hook))
         .route("/register", post(register_wrapper))
         .route("/wrappers", get(list_wrappers))

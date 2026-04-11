@@ -162,6 +162,7 @@ dependencies = [
  "serde_json",
  "signal-hook",
  "ureq",
+ "uuid",
 ]
 
 [[package]]
