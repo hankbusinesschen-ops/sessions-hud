@@ -23,6 +23,8 @@ struct SessionListView: View {
 struct CompactListView: View {
     @EnvironmentObject var model: AppModel
     @State private var showLauncher: Bool = false
+    @State private var showSettings: Bool = false
+    @AppStorage("uiFontScale") private var uiScale: Double = 1.0
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -32,7 +34,7 @@ struct CompactListView: View {
             if let err = model.lastError {
                 Divider().opacity(0.3)
                 Text(err)
-                    .font(.system(size: 10))
+                    .font(.system(size: 10 * uiScale))
                     .foregroundStyle(.red)
                     .lineLimit(1)
                     .padding(.horizontal, 12)
@@ -47,10 +49,10 @@ struct CompactListView: View {
     private var header: some View {
         HStack(spacing: 6) {
             Text("Sessions")
-                .font(.system(size: 12, weight: .semibold))
+                .font(.system(size: 12 * uiScale, weight: .semibold))
                 .foregroundStyle(.secondary)
             Text("(\(model.sessions.count))")
-                .font(.system(size: 11))
+                .font(.system(size: 11 * uiScale))
                 .foregroundStyle(.tertiary)
             Spacer()
             Button {
@@ -67,6 +69,19 @@ struct CompactListView: View {
                     .environmentObject(model)
             }
             Button {
+                showSettings = true
+            } label: {
+                Image(systemName: "gearshape.fill")
+                    .font(.system(size: 13))
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .help("Settings")
+            .popover(isPresented: $showSettings, arrowEdge: .top) {
+                SettingsPopover(isPresented: $showSettings)
+            }
+            Button {
+                NSLog("HUD: compact quit button tapped")
                 NSApp.terminate(nil)
             } label: {
                 Image(systemName: "xmark.circle.fill")
@@ -86,7 +101,7 @@ struct CompactListView: View {
             VStack {
                 Spacer()
                 Text("no sessions")
-                    .font(.system(size: 11))
+                    .font(.system(size: 11 * uiScale))
                     .foregroundStyle(.tertiary)
                 Spacer()
             }
@@ -130,7 +145,7 @@ struct CompactListView: View {
     private func groupHeader(_ label: String) -> some View {
         HStack {
             Text(label)
-                .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                .font(.system(size: 10 * uiScale, weight: .semibold, design: .monospaced))
                 .foregroundStyle(.tertiary)
             Spacer()
         }
@@ -147,7 +162,8 @@ struct CompactListView: View {
     /// the session has a wrapper, and confirms first.
     private func confirmAndClose(_ session: SessionSummary) {
         let alert = NSAlert()
-        if session.wrapperId != nil {
+        let isLive = session.wrapperId != nil && session.status != .exited
+        if isLive {
             alert.messageText = "Terminate “\(session.name)”?"
             alert.informativeText = "Sends SIGTERM to the ccw/cxw wrapper. Daemon escalates to SIGKILL after 3 seconds."
             alert.alertStyle = .warning
@@ -209,19 +225,20 @@ struct SessionRow: View {
     let now: Date
     let selected: Bool
     var onClose: (() -> Void)? = nil
+    @AppStorage("uiFontScale") private var uiScale: Double = 1.0
 
     var body: some View {
         HStack(spacing: 8) {
             Text(session.status.icon)
-                .font(.system(size: 13))
+                .font(.system(size: 13 * uiScale))
             VStack(alignment: .leading, spacing: 1) {
                 Text(session.name)
-                    .font(.system(size: 12, weight: .medium))
+                    .font(.system(size: 12 * uiScale, weight: .medium))
                     .lineLimit(1)
                     .truncationMode(.middle)
                 if let cwd = session.cwd {
                     Text(shortenedPath(cwd))
-                        .font(.system(size: 9))
+                        .font(.system(size: 9 * uiScale))
                         .foregroundStyle(.tertiary)
                         .lineLimit(1)
                         .truncationMode(.head)
@@ -236,9 +253,20 @@ struct SessionRow: View {
                     .font(.system(size: 9))
                     .foregroundStyle(.tertiary)
                     .help("injectable — launched via ccw/cxw")
+            } else {
+                Text("RO")
+                    .font(.system(size: 8 * uiScale, weight: .semibold))
+                    .foregroundStyle(.orange)
+                    .padding(.horizontal, 3)
+                    .padding(.vertical, 1)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 3)
+                            .stroke(Color.orange.opacity(0.6), lineWidth: 1)
+                    )
+                    .help("read-only — native claude, approvals disabled")
             }
             Text(rightLabel)
-                .font(.system(size: 10, design: .monospaced))
+                .font(.system(size: 10 * uiScale, design: .monospaced))
                 .foregroundStyle(.secondary)
             if let onClose {
                 Button(action: onClose) {
@@ -313,6 +341,8 @@ struct SessionRow: View {
 
 struct ChatView: View {
     @EnvironmentObject var model: AppModel
+    @State private var showSettings: Bool = false
+    @AppStorage("uiFontScale") private var uiScale: Double = 1.0
 
     private var selectedSummary: SessionSummary? {
         guard let id = model.selectedId else { return nil }
@@ -323,6 +353,10 @@ struct ChatView: View {
         VStack(spacing: 0) {
             header
             Divider().opacity(0.3)
+            if let s = selectedSummary, s.wrapperId == nil, s.status != .exited {
+                readOnlyBanner
+                Divider().opacity(0.3)
+            }
             if let prompt = selectedSummary?.pendingPrompt, let sid = model.selectedId {
                 PromptBanner(
                     prompt: prompt,
@@ -337,7 +371,7 @@ struct ChatView: View {
             injectBar
             if let s = model.injectStatus {
                 Text(s)
-                    .font(.system(size: 10))
+                    .font(.system(size: 10 * uiScale))
                     .foregroundStyle(.orange)
                     .lineLimit(1)
                     .padding(.horizontal, 12)
@@ -362,15 +396,15 @@ struct ChatView: View {
             .help("Back to list")
 
             Text(selectedSummary?.status.icon ?? "⚫")
-                .font(.system(size: 14))
+                .font(.system(size: 14 * uiScale))
 
             VStack(alignment: .leading, spacing: 1) {
                 Text(selectedSummary?.name ?? model.selectedId ?? "")
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(.system(size: 13 * uiScale, weight: .semibold))
                     .lineLimit(1)
                 if let cwd = selectedSummary?.cwd {
                     Text(cwd)
-                        .font(.system(size: 10))
+                        .font(.system(size: 10 * uiScale))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .truncationMode(.head)
@@ -381,7 +415,7 @@ struct ChatView: View {
 
             VStack(alignment: .trailing, spacing: 2) {
                 Text(selectedSummary?.status.label ?? "")
-                    .font(.system(size: 10, design: .monospaced))
+                    .font(.system(size: 10 * uiScale, design: .monospaced))
                     .foregroundStyle(.secondary)
                 if let stats = selectedSummary?.stats, stats.hasAnyPct || stats.modelDisplay != nil {
                     StatsLine(stats: stats, fontSize: 10)
@@ -413,6 +447,19 @@ struct ChatView: View {
             .help(selectedSummary?.wrapperId != nil
                   ? "Terminate (SIGTERM wrapper)"
                   : "Forget session (remove from list)")
+
+            Button {
+                showSettings = true
+            } label: {
+                Image(systemName: "gearshape.fill")
+                    .font(.system(size: 13))
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .help("Settings")
+            .popover(isPresented: $showSettings, arrowEdge: .top) {
+                SettingsPopover(isPresented: $showSettings)
+            }
 
             Button {
                 NSApp.terminate(nil)
@@ -468,7 +515,7 @@ struct ChatView: View {
         VStack {
             Spacer()
             Text(text)
-                .font(.system(size: 11))
+                .font(.system(size: 11 * uiScale))
                 .foregroundStyle(.tertiary)
             Spacer()
         }
@@ -479,21 +526,48 @@ struct ChatView: View {
         selectedSummary?.wrapperId != nil
     }
 
+    private var readOnlyBanner: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "lock.fill")
+                .foregroundStyle(.orange)
+                .font(.system(size: 12))
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Read-only session")
+                    .font(.system(size: 11 * uiScale, weight: .semibold))
+                Text("Native claude — approvals and input disabled. Relaunch via ccw to enable them.")
+                    .font(.system(size: 10 * uiScale))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+            Spacer()
+            Button("Relaunch as ccw") {
+                model.relaunchSelectedAsCcw()
+            }
+            .font(.system(size: 11 * uiScale))
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
+            .disabled((selectedSummary?.cwd ?? "").isEmpty)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(Color.orange.opacity(0.12))
+    }
+
     @ViewBuilder
     private var injectBar: some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: 6) {
                 TextField("type a reply…", text: $model.injectDraft, onCommit: send)
                     .textFieldStyle(.roundedBorder)
-                    .font(.system(size: 12))
+                    .font(.system(size: 12 * uiScale))
                     .disabled(!canInject)
                 Button("Send ⏎", action: send)
-                    .font(.system(size: 11))
+                    .font(.system(size: 11 * uiScale))
                     .disabled(!canInject || model.injectDraft.isEmpty || model.selectedId == nil)
             }
             if !canInject {
                 Text("read-only — launch this session via ccw to enable input")
-                    .font(.system(size: 10))
+                    .font(.system(size: 10 * uiScale))
                     .foregroundStyle(.tertiary)
             }
         }
@@ -542,16 +616,17 @@ struct ChatView: View {
 
 struct MessageBubble: View {
     let message: SessionMessage
+    @AppStorage("uiFontScale") private var uiScale: Double = 1.0
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 6) {
                 Text(roleLabel)
-                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    .font(.system(size: 10 * uiScale, weight: .semibold, design: .monospaced))
                     .foregroundStyle(roleColor)
                 if message.kind != "text" {
                     Text(kindLabel)
-                        .font(.system(size: 9, design: .monospaced))
+                        .font(.system(size: 9 * uiScale, design: .monospaced))
                         .foregroundStyle(.tertiary)
                 }
             }
@@ -583,7 +658,7 @@ struct MessageBubble: View {
                 .textSelection(.enabled)
         } else {
             Text(message.text)
-                .font(.system(size: 11, design: .monospaced))
+                .font(.system(size: 11 * uiScale, design: .monospaced))
                 .textSelection(.enabled)
                 .fixedSize(horizontal: false, vertical: true)
         }
@@ -635,6 +710,7 @@ struct PromptBanner: View {
     let prompt: PendingPrompt
     let sessionId: String
     let canInject: Bool
+    @AppStorage("uiFontScale") private var uiScale: Double = 1.0
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -660,7 +736,7 @@ struct PromptBanner: View {
             }
             if !canInject {
                 Text("read-only — answer in terminal (launch via ccw to enable)")
-                    .font(.system(size: 10))
+                    .font(.system(size: 10 * uiScale))
                     .foregroundStyle(.tertiary)
             }
         }
@@ -675,7 +751,7 @@ struct PromptBanner: View {
         HStack(alignment: .top, spacing: 6) {
             Text("⚠")
             Text(message.isEmpty ? "Claude needs your permission" : message)
-                .font(.system(size: 12, weight: .medium))
+                .font(.system(size: 12 * uiScale, weight: .medium))
                 .fixedSize(horizontal: false, vertical: true)
         }
         HStack(spacing: 6) {
@@ -691,7 +767,7 @@ struct PromptBanner: View {
         HStack(alignment: .top, spacing: 6) {
             Text("📋")
             Text(message.isEmpty ? "Claude needs approval for the plan" : message)
-                .font(.system(size: 12, weight: .medium))
+                .font(.system(size: 12 * uiScale, weight: .medium))
                 .fixedSize(horizontal: false, vertical: true)
         }
         HStack(spacing: 6) {
@@ -707,7 +783,7 @@ struct PromptBanner: View {
         HStack(alignment: .top, spacing: 6) {
             Text("❓")
             Text(message.isEmpty ? "Claude is waiting for input" : message)
-                .font(.system(size: 12))
+                .font(.system(size: 12 * uiScale))
                 .fixedSize(horizontal: false, vertical: true)
         }
     }
@@ -728,6 +804,7 @@ struct QuestionView: View {
 
     @State private var selected: Set<String> = []
     @State private var freeText: String = ""
+    @AppStorage("uiFontScale") private var uiScale: Double = 1.0
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -736,11 +813,11 @@ struct QuestionView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     if !question.header.isEmpty {
                         Text(question.header)
-                            .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                            .font(.system(size: 10 * uiScale, weight: .semibold, design: .monospaced))
                             .foregroundStyle(.secondary)
                     }
                     Text(question.question)
-                        .font(.system(size: 12, weight: .medium))
+                        .font(.system(size: 12 * uiScale, weight: .medium))
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
@@ -752,10 +829,10 @@ struct QuestionView: View {
             HStack(spacing: 6) {
                 TextField("or type your answer…", text: $freeText)
                     .textFieldStyle(.roundedBorder)
-                    .font(.system(size: 11))
+                    .font(.system(size: 11 * uiScale))
                     .disabled(!canInject)
                 Button("Submit") { submit() }
-                    .font(.system(size: 11))
+                    .font(.system(size: 11 * uiScale))
                     .disabled(!canInject || (selected.isEmpty && freeText.isEmpty))
             }
         }
@@ -772,10 +849,10 @@ struct QuestionView: View {
                     .foregroundStyle(selected.contains(opt.label) ? Color.accentColor : .secondary)
                 VStack(alignment: .leading, spacing: 1) {
                     Text(opt.label)
-                        .font(.system(size: 12, weight: .medium))
+                        .font(.system(size: 12 * uiScale, weight: .medium))
                     if !opt.description.isEmpty {
                         Text(opt.description)
-                            .font(.system(size: 10))
+                            .font(.system(size: 10 * uiScale))
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                     }
@@ -847,6 +924,7 @@ struct QuestionView: View {
 struct StatsLine: View {
     let stats: SessionStats
     let fontSize: CGFloat
+    @AppStorage("uiFontScale") private var uiScale: Double = 1.0
 
     var body: some View {
         HStack(spacing: 6) {
@@ -863,7 +941,7 @@ struct StatsLine: View {
                 Text("7d \(Int(p.rounded()))%").foregroundStyle(Self.color(for: p))
             }
         }
-        .font(.system(size: fontSize, design: .monospaced))
+        .font(.system(size: fontSize * uiScale, design: .monospaced))
         .lineLimit(1)
         .help(tooltip)
     }
@@ -903,11 +981,12 @@ struct LauncherPopover: View {
     @State private var name: String = ""
     @State private var cwd: String = ""
     @State private var errorMessage: String?
+    @AppStorage("uiFontScale") private var uiScale: Double = 1.0
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("New session")
-                .font(.system(size: 13, weight: .semibold))
+                .font(.system(size: 13 * uiScale, weight: .semibold))
 
             Picker("Flavor", selection: $flavor) {
                 ForEach(WrapperFlavor.allCases) { f in
@@ -929,21 +1008,21 @@ struct LauncherPopover: View {
 
             HStack(spacing: 6) {
                 Text("Name")
-                    .font(.system(size: 11))
+                    .font(.system(size: 11 * uiScale))
                     .foregroundStyle(.secondary)
                     .frame(width: 40, alignment: .leading)
                 TextField("session name", text: $name)
                     .textFieldStyle(.roundedBorder)
-                    .font(.system(size: 12))
+                    .font(.system(size: 12 * uiScale))
             }
 
             HStack(spacing: 6) {
                 Text("Dir")
-                    .font(.system(size: 11))
+                    .font(.system(size: 11 * uiScale))
                     .foregroundStyle(.secondary)
                     .frame(width: 40, alignment: .leading)
                 Text(cwd.isEmpty ? "— pick below —" : shortenedPath(cwd))
-                    .font(.system(size: 11, design: .monospaced))
+                    .font(.system(size: 11 * uiScale, design: .monospaced))
                     .foregroundStyle(cwd.isEmpty ? .tertiary : .primary)
                     .lineLimit(1)
                     .truncationMode(.head)
@@ -952,7 +1031,7 @@ struct LauncherPopover: View {
 
             if !model.recentProjectRoots.isEmpty {
                 Text("Recent")
-                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    .font(.system(size: 10 * uiScale, weight: .semibold, design: .monospaced))
                     .foregroundStyle(.tertiary)
                 VStack(alignment: .leading, spacing: 2) {
                     ForEach(model.recentProjectRoots.prefix(6), id: \.self) { root in
@@ -964,7 +1043,7 @@ struct LauncherPopover: View {
                                     .font(.system(size: 10))
                                     .foregroundStyle(cwd == root ? Color.accentColor : .secondary)
                                 Text(shortenedPath(root))
-                                    .font(.system(size: 11, design: .monospaced))
+                                    .font(.system(size: 11 * uiScale, design: .monospaced))
                                     .lineLimit(1)
                                     .truncationMode(.head)
                                 Spacer(minLength: 0)
@@ -977,11 +1056,11 @@ struct LauncherPopover: View {
             }
 
             Button("Choose directory…") { chooseDirectory() }
-                .font(.system(size: 11))
+                .font(.system(size: 11 * uiScale))
 
             if let err = errorMessage {
                 Text(err)
-                    .font(.system(size: 10))
+                    .font(.system(size: 10 * uiScale))
                     .foregroundStyle(.red)
                     .lineLimit(2)
             }
@@ -1048,5 +1127,39 @@ struct LauncherPopover: View {
             return "~" + path.dropFirst(home.count)
         }
         return path
+    }
+}
+
+// MARK: - Settings popover
+
+struct SettingsPopover: View {
+    @Binding var isPresented: Bool
+    @AppStorage("uiFontScale") private var scale: Double = 1.0
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("UI scale")
+                    .font(.system(size: 12, weight: .semibold))
+                Spacer()
+                Text(String(format: "%.2fx", scale))
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+            Slider(value: $scale, in: 0.85...1.5, step: 0.05)
+            Text("⌘+ / ⌘- / ⌘0")
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundStyle(.tertiary)
+            HStack {
+                Button("Reset") { scale = 1.0 }
+                    .buttonStyle(.bordered)
+                Spacer()
+                Button("Done") { isPresented = false }
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(14)
+        .frame(width: 240)
     }
 }

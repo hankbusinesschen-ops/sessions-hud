@@ -194,6 +194,32 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Relaunch the currently selected native (non-wrapper) session as a
+    /// ccw-wrapped one by asking Terminal.app / iTerm to open a new window
+    /// running `ccw <name>` in the same cwd. The original native process
+    /// keeps running — the user can close it from its own terminal — but
+    /// a fresh wrapper-backed session will replace it in the HUD list as
+    /// soon as its SessionStart hook fires.
+    func relaunchSelectedAsCcw() {
+        guard let sid = selectedId,
+              let s = sessions.first(where: { $0.id == sid }) else { return }
+        guard s.wrapperId == nil else { return }
+        guard let cwd = s.cwd, !cwd.isEmpty else {
+            self.injectStatus = "relaunch: unknown cwd"
+            return
+        }
+        if let err = TerminalFocus.launchNewSession(
+            flavor: .ccw,
+            mode: .defaultMode,
+            name: s.name,
+            cwd: cwd
+        ) {
+            self.injectStatus = "relaunch failed: \(err)"
+        } else {
+            self.injectStatus = "relaunching as ccw…"
+        }
+    }
+
     /// Drop the session from the daemon's in-memory registry without killing
     /// anything. Useful for hook-only sessions (native `claude`) the user just
     /// wants off the HUD list.
