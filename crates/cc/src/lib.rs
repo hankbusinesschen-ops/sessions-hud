@@ -45,6 +45,19 @@ impl Drop for RawModeGuard {
     }
 }
 
+/// Basename of argv[0] — used as the stderr message prefix so whether we were
+/// invoked as `ccw` or `cxw` (or anything else) the diagnostics match.
+fn bin_name() -> String {
+    std::env::args()
+        .next()
+        .and_then(|a| {
+            std::path::PathBuf::from(a)
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "ccw".to_string())
+}
+
 #[derive(Serialize)]
 struct RegisterRequest<'a> {
     name: &'a str,
@@ -108,12 +121,12 @@ fn register_with_daemon(name: &str, cwd: &str) -> Option<Registration> {
                 socket_path: r.socket_path,
             }),
             Err(e) => {
-                eprintln!("cc: register decode failed: {e}");
+                eprintln!("{}: register decode failed: {e}", bin_name());
                 None
             }
         },
         Err(e) => {
-            eprintln!("cc: sessionsd not reachable ({e}) — running unattached");
+            eprintln!("{}: sessionsd not reachable ({e}) — running unattached", bin_name());
             None
         }
     }
@@ -378,7 +391,7 @@ pub fn run(flavor: Flavor) -> Result<()> {
     // before flipping into raw mode so bind errors surface cleanly.
     if let Some(ref reg) = registration {
         if let Err(e) = start_inject_listener(reg.socket_path.clone(), tx.clone()) {
-            eprintln!("cc: failed to bind inject socket: {e}");
+            eprintln!("{}: failed to bind inject socket: {e}", bin_name());
         }
     }
 

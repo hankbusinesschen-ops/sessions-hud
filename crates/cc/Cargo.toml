@@ -10,12 +10,12 @@ name = "cc_wrapper"
 path = "src/lib.rs"
 
 [[bin]]
-name = "cc"
-path = "src/bin/cc.rs"
+name = "ccw"
+path = "src/bin/ccw.rs"
 
 [[bin]]
-name = "cx"
-path = "src/bin/cx.rs"
+name = "cxw"
+path = "src/bin/cxw.rs"
 
 [dependencies]
 portable-pty = "0.8"

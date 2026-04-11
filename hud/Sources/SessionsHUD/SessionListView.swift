@@ -178,6 +178,12 @@ struct SessionRow: View {
                 }
             }
             Spacer(minLength: 4)
+            if session.wrapperId != nil {
+                Image(systemName: "link")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.tertiary)
+                    .help("injectable — launched via ccw/cxw")
+            }
             Text(rightLabel)
                 .font(.system(size: 10, design: .monospaced))
                 .foregroundStyle(.secondary)
@@ -359,14 +365,27 @@ struct ChatView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
+    private var canInject: Bool {
+        selectedSummary?.wrapperId != nil
+    }
+
+    @ViewBuilder
     private var injectBar: some View {
-        HStack(spacing: 6) {
-            TextField("type a reply…", text: $model.injectDraft, onCommit: send)
-                .textFieldStyle(.roundedBorder)
-                .font(.system(size: 12))
-            Button("Send ⏎", action: send)
-                .font(.system(size: 11))
-                .disabled(model.injectDraft.isEmpty || model.selectedId == nil)
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 6) {
+                TextField("type a reply…", text: $model.injectDraft, onCommit: send)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 12))
+                    .disabled(!canInject)
+                Button("Send ⏎", action: send)
+                    .font(.system(size: 11))
+                    .disabled(!canInject || model.injectDraft.isEmpty || model.selectedId == nil)
+            }
+            if !canInject {
+                Text("read-only — launch this session via ccw to enable input")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+            }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
