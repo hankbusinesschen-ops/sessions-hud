@@ -19,6 +19,7 @@ use tokio::io::{AsyncBufReadExt, AsyncSeekExt, BufReader, SeekFrom};
 const LISTEN_ADDR: &str = "127.0.0.1:39501";
 const TAIL_INTERVAL: Duration = Duration::from_millis(500);
 const MAX_MESSAGES_PER_SESSION: usize = 500;
+const WRAPPER_PRUNE_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -237,6 +238,59 @@ async fn list_wrappers(State(state): State<AppState>) -> Json<Vec<Wrapper>> {
     Json(state.wrappers.read().values().cloned().collect())
 }
 
+/// Periodically check that each registered wrapper's PID is still alive.
+/// `cc` should call DELETE /wrappers/:id on clean exit, but if the user
+/// closes their terminal window the shell sends SIGHUP and cc gets killed
+/// before cleanup runs. This loop catches that case (and any other crash)
+/// by polling kill(pid, 0).
+async fn prune_dead_wrappers(state: AppState) {
+    loop {
+        tokio::time::sleep(WRAPPER_PRUNE_INTERVAL).await;
+
+        // Snapshot dead wrappers under a read lock so we don't hold the
+        // write lock during the syscall sweep.
+        let dead: Vec<(String, Option<String>)> = {
+            let wrappers = state.wrappers.read();
+            wrappers
+                .iter()
+                .filter_map(|(id, w)| {
+                    let alive = unsafe { libc::kill(w.pid as i32, 0) == 0 };
+                    if alive {
+                        None
+                    } else {
+                        Some((id.clone(), w.session_id.clone()))
+                    }
+                })
+                .collect()
+        };
+
+        if dead.is_empty() {
+            continue;
+        }
+
+        {
+            let mut wrappers = state.wrappers.write();
+            for (wid, _) in &dead {
+                wrappers.remove(wid);
+                tracing::info!(wrapper_id = %wid, "pruned dead wrapper");
+            }
+        }
+
+        // Mark each orphaned session as exited so the HUD can show 🔴.
+        {
+            let mut reg = state.registry.write();
+            for (_, sid) in &dead {
+                if let Some(sid) = sid {
+                    if let Some(s) = reg.get_mut(sid) {
+                        s.status = Status::Exited;
+                        s.last_event_at = Utc::now();
+                    }
+                }
+            }
+        }
+    }
+}
+
 async fn tail_session(registry: Registry, session_id: String) {
     let path = {
         let reg = registry.read();
@@ -448,6 +502,9 @@ async fn main() -> Result<()> {
         registry: Arc::new(RwLock::new(HashMap::new())),
         wrappers: Arc::new(RwLock::new(HashMap::new())),
     };
+
+    // Background task: prune wrappers whose PID has gone away.
+    tokio::spawn(prune_dead_wrappers(state.clone()));
 
     let app = Router::new()
         .route("/health", get(health))

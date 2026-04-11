@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 struct SessionListView: View {
     @EnvironmentObject var model: AppModel
@@ -33,6 +34,15 @@ struct SessionListView: View {
                 .font(.system(size: 11))
                 .foregroundStyle(.tertiary)
             Spacer()
+            Button {
+                NSApp.terminate(nil)
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.system(size: 13))
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .help("Quit Sessions HUD")
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
