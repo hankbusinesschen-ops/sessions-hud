@@ -428,7 +428,13 @@ struct ChatView: View {
         guard let id = model.selectedId else { return }
         let text = model.injectDraft + "\r"
         let sid = id
-        model.injectDraft = ""
+        // Clearing injectDraft synchronously here doesn't actually blank the
+        // TextField on macOS — onCommit fires inside the field's own edit
+        // cycle, so the binding update gets overwritten. Deferring one tick
+        // lets the field settle first.
+        DispatchQueue.main.async {
+            model.injectDraft = ""
+        }
         Task { await model.injectInput(sessionId: sid, text: text) }
     }
 
