@@ -6,10 +6,14 @@ final class AppModel: ObservableObject {
     @Published var sessions: [SessionSummary] = []
     @Published var lastError: String?
     @Published var now: Date = Date()
+    @Published var selectedId: String?
+    @Published var injectDraft: String = ""
+    @Published var injectStatus: String?
 
     private var pollTimer: Timer?
     private var clockTimer: Timer?
     private let url = URL(string: "http://127.0.0.1:39501/sessions")!
+    private let daemonBase = "http://127.0.0.1:39501"
 
     private let decoder: JSONDecoder = {
         let d = JSONDecoder()
@@ -52,6 +56,27 @@ final class AppModel: ObservableObject {
             self.lastError = nil
         } catch {
             self.lastError = "daemon: \(error.localizedDescription)"
+        }
+    }
+
+    /// POST the given text to `/sessions/<id>/input`. On success, the daemon
+    /// writes the bytes into the wrapper's unix socket, which the `cc` PTY
+    /// forwards as keystrokes into the underlying child process.
+    func injectInput(sessionId: String, text: String) async {
+        guard let url = URL(string: "\(daemonBase)/sessions/\(sessionId)/input") else { return }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try? JSONSerialization.data(withJSONObject: ["text": text])
+        do {
+            let (_, resp) = try await URLSession.shared.data(for: req)
+            if let http = resp as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+                self.injectStatus = "inject failed: HTTP \(http.statusCode)"
+            } else {
+                self.injectStatus = nil
+            }
+        } catch {
+            self.injectStatus = "inject error: \(error.localizedDescription)"
         }
     }
 }

@@ -21,6 +21,14 @@ const TAIL_INTERVAL: Duration = Duration::from_millis(500);
 const MAX_MESSAGES_PER_SESSION: usize = 500;
 const WRAPPER_PRUNE_INTERVAL: Duration = Duration::from_secs(5);
 
+fn socket_dir() -> PathBuf {
+    std::env::temp_dir().join("sessionsd")
+}
+
+fn wrapper_socket_path(wrapper_id: &str) -> PathBuf {
+    socket_dir().join(format!("cc-{wrapper_id}.sock"))
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum Status {
@@ -64,6 +72,8 @@ struct Wrapper {
     pid: u32,
     /// Bound when the SessionStart hook arrives carrying our wrapper_id.
     session_id: Option<String>,
+    /// Unix domain socket `cc` binds to receive HUD-injected input.
+    socket_path: String,
     registered_at: DateTime<Utc>,
 }
 
@@ -203,6 +213,7 @@ struct RegisterRequest {
 #[derive(Serialize)]
 struct RegisterResponse {
     wrapper_id: String,
+    socket_path: String,
 }
 
 async fn register_wrapper(
@@ -210,7 +221,8 @@ async fn register_wrapper(
     Json(req): Json<RegisterRequest>,
 ) -> Json<RegisterResponse> {
     let id = uuid::Uuid::new_v4().to_string();
-    tracing::info!(wrapper_id = %id, name = %req.name, pid = req.pid, "wrapper registered");
+    let sock = wrapper_socket_path(&id).to_string_lossy().to_string();
+    tracing::info!(wrapper_id = %id, name = %req.name, pid = req.pid, socket = %sock, "wrapper registered");
     state.wrappers.write().insert(
         id.clone(),
         Wrapper {
@@ -219,10 +231,14 @@ async fn register_wrapper(
             cwd: req.cwd,
             pid: req.pid,
             session_id: None,
+            socket_path: sock.clone(),
             registered_at: Utc::now(),
         },
     );
-    Json(RegisterResponse { wrapper_id: id })
+    Json(RegisterResponse {
+        wrapper_id: id,
+        socket_path: sock,
+    })
 }
 
 async fn unregister_wrapper(
@@ -230,12 +246,78 @@ async fn unregister_wrapper(
     State(state): State<AppState>,
 ) -> StatusCode {
     let removed = state.wrappers.write().remove(&id);
+    if let Some(ref w) = removed {
+        let _ = std::fs::remove_file(&w.socket_path);
+    }
     tracing::info!(wrapper_id = %id, found = removed.is_some(), "wrapper unregistered");
     StatusCode::OK
 }
 
 async fn list_wrappers(State(state): State<AppState>) -> Json<Vec<Wrapper>> {
     Json(state.wrappers.read().values().cloned().collect())
+}
+
+#[derive(Deserialize)]
+struct InjectRequest {
+    text: String,
+}
+
+/// Connect to a wrapper's unix socket and write `text` into it. The wrapper's
+/// socket listener forwards those bytes into its PTY master, which lands in
+/// the child process's stdin.
+fn write_to_wrapper_socket(socket_path: String, text: String) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+    let mut s = UnixStream::connect(&socket_path)?;
+    s.write_all(text.as_bytes())?;
+    s.flush()
+}
+
+async fn inject_by_session(
+    Path(session_id): Path<String>,
+    State(state): State<AppState>,
+    Json(req): Json<InjectRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let wrapper_id = {
+        let reg = state.registry.read();
+        reg.get(&session_id)
+            .and_then(|s| s.wrapper_id.clone())
+            .ok_or((StatusCode::NOT_FOUND, "session has no wrapper".into()))?
+    };
+    let socket_path = {
+        let wrappers = state.wrappers.read();
+        wrappers
+            .get(&wrapper_id)
+            .map(|w| w.socket_path.clone())
+            .ok_or((StatusCode::NOT_FOUND, "wrapper gone".into()))?
+    };
+    tokio::task::spawn_blocking(move || write_to_wrapper_socket(socket_path, req.text))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("join: {e}")))?
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("inject: {e}")))?;
+    Ok(StatusCode::OK)
+}
+
+/// Debug-only injection: bypass session lookup and target a wrapper directly.
+/// Useful for E2E tests where the PTY child (e.g. `bash` stub) doesn't emit
+/// Claude Code hooks, so no session_id is ever bound.
+async fn inject_by_wrapper(
+    Path(wrapper_id): Path<String>,
+    State(state): State<AppState>,
+    Json(req): Json<InjectRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let socket_path = {
+        let wrappers = state.wrappers.read();
+        wrappers
+            .get(&wrapper_id)
+            .map(|w| w.socket_path.clone())
+            .ok_or((StatusCode::NOT_FOUND, "wrapper not found".into()))?
+    };
+    tokio::task::spawn_blocking(move || write_to_wrapper_socket(socket_path, req.text))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("join: {e}")))?
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("inject: {e}")))?;
+    Ok(StatusCode::OK)
 }
 
 /// Periodically check that each registered wrapper's PID is still alive.
@@ -249,7 +331,7 @@ async fn prune_dead_wrappers(state: AppState) {
 
         // Snapshot dead wrappers under a read lock so we don't hold the
         // write lock during the syscall sweep.
-        let dead: Vec<(String, Option<String>)> = {
+        let dead: Vec<(String, Option<String>, String)> = {
             let wrappers = state.wrappers.read();
             wrappers
                 .iter()
@@ -258,7 +340,7 @@ async fn prune_dead_wrappers(state: AppState) {
                     if alive {
                         None
                     } else {
-                        Some((id.clone(), w.session_id.clone()))
+                        Some((id.clone(), w.session_id.clone(), w.socket_path.clone()))
                     }
                 })
                 .collect()
@@ -270,8 +352,9 @@ async fn prune_dead_wrappers(state: AppState) {
 
         {
             let mut wrappers = state.wrappers.write();
-            for (wid, _) in &dead {
+            for (wid, _, sock) in &dead {
                 wrappers.remove(wid);
+                let _ = std::fs::remove_file(sock);
                 tracing::info!(wrapper_id = %wid, "pruned dead wrapper");
             }
         }
@@ -279,7 +362,7 @@ async fn prune_dead_wrappers(state: AppState) {
         // Mark each orphaned session as exited so the HUD can show 🔴.
         {
             let mut reg = state.registry.write();
-            for (_, sid) in &dead {
+            for (_, sid, _) in &dead {
                 if let Some(sid) = sid {
                     if let Some(s) = reg.get_mut(sid) {
                         s.status = Status::Exited;
@@ -498,6 +581,15 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    // Ensure the unix socket directory exists with restrictive perms so only
+    // our uid can read/write the per-wrapper sockets.
+    {
+        let dir = socket_dir();
+        std::fs::create_dir_all(&dir)?;
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
+
     let state = AppState {
         registry: Arc::new(RwLock::new(HashMap::new())),
         wrappers: Arc::new(RwLock::new(HashMap::new())),
@@ -510,10 +602,12 @@ async fn main() -> Result<()> {
         .route("/health", get(health))
         .route("/sessions", get(list_sessions))
         .route("/sessions/:id", get(get_session))
+        .route("/sessions/:id/input", post(inject_by_session))
         .route("/hook/:event", post(handle_hook))
         .route("/register", post(register_wrapper))
         .route("/wrappers", get(list_wrappers))
         .route("/wrappers/:id", delete(unregister_wrapper))
+        .route("/wrappers/:id/input", post(inject_by_wrapper))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(LISTEN_ADDR).await?;

@@ -16,6 +16,8 @@ use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use serde::{Deserialize, Serialize};
 use signal_hook::{consts::SIGWINCH, iterator::Signals};
 use std::io::{IsTerminal, Read, Write};
+use std::os::unix::net::UnixListener;
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -53,6 +55,14 @@ struct RegisterRequest<'a> {
 #[derive(Deserialize)]
 struct RegisterResponse {
     wrapper_id: String,
+    socket_path: String,
+}
+
+/// Registration info returned by the daemon — wrapper_id + the unix socket
+/// the wrapper should bind for HUD input injection.
+struct Registration {
+    wrapper_id: String,
+    socket_path: String,
 }
 
 fn daemon_url() -> String {
@@ -62,7 +72,7 @@ fn daemon_url() -> String {
 /// Try to register with sessionsd. Soft-fails: if the daemon isn't up, cc
 /// still works as a transparent passthrough — you just don't get the named
 /// session in the HUD.
-fn register_with_daemon(name: &str, cwd: &str) -> Option<String> {
+fn register_with_daemon(name: &str, cwd: &str) -> Option<Registration> {
     let req = RegisterRequest {
         name,
         cwd,
@@ -75,7 +85,10 @@ fn register_with_daemon(name: &str, cwd: &str) -> Option<String> {
         .build();
     match agent.post(&url).send_json(serde_json::to_value(&req).ok()?) {
         Ok(resp) => match resp.into_json::<RegisterResponse>() {
-            Ok(r) => Some(r.wrapper_id),
+            Ok(r) => Some(Registration {
+                wrapper_id: r.wrapper_id,
+                socket_path: r.socket_path,
+            }),
             Err(e) => {
                 eprintln!("cc: register decode failed: {e}");
                 None
@@ -86,6 +99,42 @@ fn register_with_daemon(name: &str, cwd: &str) -> Option<String> {
             None
         }
     }
+}
+
+/// Bind a unix domain socket the daemon can connect to in order to inject
+/// HUD-sourced keystrokes into our PTY. Each accepted connection gets a
+/// reader thread that drains bytes and pushes them through `tx` to the
+/// single pty-writer thread.
+fn start_inject_listener(path: String, tx: mpsc::Sender<Vec<u8>>) -> Result<()> {
+    // Clean up any stale socket left behind by an ungracefully-killed cc.
+    let _ = std::fs::remove_file(&path);
+    let listener = UnixListener::bind(&path)
+        .with_context(|| format!("bind unix socket {path}"))?;
+    // Only the current uid should be able to connect (the daemon runs as us).
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+
+    thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(mut conn) = conn else { continue };
+            let tx = tx.clone();
+            thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                loop {
+                    match conn.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            if tx.send(buf[..n].to_vec()).is_err() {
+                                return;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
+    });
+    Ok(())
 }
 
 fn unregister_from_daemon(wrapper_id: &str) {
@@ -120,7 +169,7 @@ fn main() -> Result<()> {
         .ok()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default();
-    let wrapper_id = register_with_daemon(&name, &cwd_str);
+    let registration = register_with_daemon(&name, &cwd_str);
 
     // Detect host terminal size; fall back to 80x24 if we're not on a tty.
     let (cols, rows) = terminal::size().unwrap_or((80, 24));
@@ -142,6 +191,19 @@ fn main() -> Result<()> {
     for a in &extra_args {
         cmd.arg(a);
     }
+    // When wrapping `claude`, default to --dangerously-skip-permissions to
+    // match the user's day-to-day workflow. Escape hatches:
+    //   - user already passed the flag in `-- <args>`
+    //   - CC_NO_SKIP_PERMISSIONS=1
+    //   - non-claude target (bash / cat / codex stubs for testing)
+    {
+        let is_claude = target == "claude";
+        let user_has_flag = extra_args.iter().any(|a| a == "--dangerously-skip-permissions");
+        let opt_out = std::env::var("CC_NO_SKIP_PERMISSIONS").ok().as_deref() == Some("1");
+        if is_claude && !user_has_flag && !opt_out {
+            cmd.arg("--dangerously-skip-permissions");
+        }
+    }
     if let Ok(cwd) = std::env::current_dir() {
         cmd.cwd(cwd);
     }
@@ -149,8 +211,8 @@ fn main() -> Result<()> {
         cmd.env(k, v);
     }
     cmd.env("CC_WRAPPER_NAME", &name);
-    if let Some(ref id) = wrapper_id {
-        cmd.env("CC_WRAPPER_ID", id);
+    if let Some(ref reg) = registration {
+        cmd.env("CC_WRAPPER_ID", &reg.wrapper_id);
     }
 
     let mut child = pair
@@ -169,6 +231,30 @@ fn main() -> Result<()> {
         .take_writer()
         .context("take pty writer")?;
     let master = Arc::new(Mutex::new(master));
+
+    // All PTY stdin sources (keyboard + HUD inject socket) funnel through one
+    // mpsc channel into a single writer thread. portable-pty's Writer is
+    // `Box<dyn Write + Send>` and can only have one owner, so sharing via a
+    // channel is simpler than wrapping it in a mutex.
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+
+    // Writer thread — sole owner of the PTY master writer.
+    thread::spawn(move || {
+        while let Ok(bytes) = rx.recv() {
+            if writer.write_all(&bytes).is_err() {
+                break;
+            }
+            let _ = writer.flush();
+        }
+    });
+
+    // Start the HUD inject listener if we successfully registered. We do this
+    // before flipping into raw mode so bind errors surface cleanly.
+    if let Some(ref reg) = registration {
+        if let Err(e) = start_inject_listener(reg.socket_path.clone(), tx.clone()) {
+            eprintln!("cc: failed to bind inject socket: {e}");
+        }
+    }
 
     // Now that the PTY is wired up, flip the host terminal into raw mode so
     // keystrokes flow through verbatim (Ctrl-C becomes 0x03 in stdin, etc.).
@@ -192,25 +278,28 @@ fn main() -> Result<()> {
         }
     });
 
-    // Thread: stdin → pty master
-    // This thread will be left dangling on stdin.read() when the child exits;
-    // we exit the process explicitly below so it gets reaped by the OS.
-    thread::spawn(move || {
-        let mut buf = [0u8; 4096];
-        let mut stdin = std::io::stdin();
-        loop {
-            match stdin.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    if writer.write_all(&buf[..n]).is_err() {
-                        break;
+    // Thread: stdin → channel (keyboard path).
+    {
+        let tx = tx.clone();
+        thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            let mut stdin = std::io::stdin();
+            loop {
+                match stdin.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if tx.send(buf[..n].to_vec()).is_err() {
+                            break;
+                        }
                     }
-                    let _ = writer.flush();
+                    Err(_) => break,
                 }
-                Err(_) => break,
             }
-        }
-    });
+        });
+    }
+    // Main thread no longer sends on tx; drop so the writer can shut down
+    // cleanly once stdin + any inject-listener Senders are gone.
+    drop(tx);
 
     // Thread: SIGWINCH → resize PTY to match the host terminal.
     {
@@ -239,8 +328,9 @@ fn main() -> Result<()> {
     drop(_raw);
     let _ = out_thread.join();
 
-    if let Some(ref id) = wrapper_id {
-        unregister_from_daemon(id);
+    if let Some(ref reg) = registration {
+        unregister_from_daemon(&reg.wrapper_id);
+        let _ = std::fs::remove_file(&reg.socket_path);
     }
 
     let code = if status.success() { 0 } else { status.exit_code() as i32 };

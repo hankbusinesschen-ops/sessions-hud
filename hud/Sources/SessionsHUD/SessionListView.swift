@@ -9,6 +9,10 @@ struct SessionListView: View {
             header
             Divider().opacity(0.3)
             content
+            if model.selectedId != nil {
+                Divider().opacity(0.3)
+                injectBar
+            }
             if let err = model.lastError {
                 Divider().opacity(0.3)
                 Text(err)
@@ -18,11 +22,49 @@ struct SessionListView: View {
                     .padding(.horizontal, 12)
                     .padding(.vertical, 4)
             }
+            if let s = model.injectStatus {
+                Text(s)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.orange)
+                    .lineLimit(1)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 2)
+            }
         }
         .frame(minWidth: 280, idealWidth: 280, maxWidth: .infinity,
-               minHeight: 180, idealHeight: 260, maxHeight: .infinity,
+               minHeight: 180, idealHeight: 320, maxHeight: .infinity,
                alignment: .top)
         .background(.ultraThinMaterial)
+    }
+
+    private var injectBar: some View {
+        HStack(spacing: 6) {
+            TextField("type to send…", text: $model.injectDraft, onCommit: send)
+                .textFieldStyle(.roundedBorder)
+                .font(.system(size: 11))
+            Button("Send", action: send)
+                .font(.system(size: 11))
+                .disabled(model.injectDraft.isEmpty || model.selectedId == nil)
+            Button {
+                model.selectedId = nil
+                model.injectDraft = ""
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 10))
+            }
+            .buttonStyle(.plain)
+            .help("Close input")
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+    }
+
+    private func send() {
+        guard let id = model.selectedId else { return }
+        let text = model.injectDraft + "\r"
+        let sid = id
+        model.injectDraft = ""
+        Task { await model.injectInput(sessionId: sid, text: text) }
     }
 
     private var header: some View {
@@ -63,7 +105,15 @@ struct SessionListView: View {
             ScrollView {
                 LazyVStack(spacing: 0) {
                     ForEach(model.sessions) { session in
-                        SessionRow(session: session, now: model.now)
+                        SessionRow(session: session, now: model.now, selected: model.selectedId == session.id)
+                            .contentShape(Rectangle())
+                            .onTapGesture {
+                                if model.selectedId == session.id {
+                                    model.selectedId = nil
+                                } else {
+                                    model.selectedId = session.id
+                                }
+                            }
                         Divider().opacity(0.15)
                     }
                 }
@@ -75,6 +125,7 @@ struct SessionListView: View {
 struct SessionRow: View {
     let session: SessionSummary
     let now: Date
+    let selected: Bool
 
     var body: some View {
         HStack(spacing: 8) {
@@ -100,6 +151,7 @@ struct SessionRow: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
+        .background(selected ? Color.accentColor.opacity(0.18) : Color.clear)
     }
 
     private var rightLabel: String {
