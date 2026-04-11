@@ -3,3 +3,6 @@ target/
 *.swp
 .idea/
 .vscode/
+.build/
+.swiftpm/
+hud/Package.resolved
