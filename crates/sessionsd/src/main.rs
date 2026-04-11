@@ -52,6 +52,53 @@ struct Message {
     timestamp: Option<String>,
 }
 
+/// Structured description of whatever Claude Code is currently blocking on.
+/// `Permission` and `PlanApproval` come from the Notification hook payload —
+/// three fixed choices, injectable as `1\r`/`2\r`/`3\r`. `Question` comes from
+/// transcript tailing (AskUserQuestion tool_use blocks) and carries a dynamic
+/// option list with optional multi-select + free-text fallback. `Raw` is the
+/// escape hatch for elicitation dialogs / unknown notification types — HUD
+/// shows the message but can't auto-respond.
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum PendingPrompt {
+    Permission { message: String },
+    PlanApproval { message: String },
+    Question {
+        tool_use_id: String,
+        questions: Vec<AskQuestion>,
+    },
+    Raw { message: String },
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct AskQuestion {
+    question: String,
+    header: String,
+    options: Vec<AskOption>,
+    multi_select: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct AskOption {
+    label: String,
+    description: String,
+}
+
+/// Snapshot from the most recent Claude Code statusline invocation. Captured
+/// by piping the statusline stdin JSON into `/hook/statusline`, which is the
+/// only surface Anthropic exposes quota percentages on. Fields are all
+/// optional because real payloads sometimes omit blocks (e.g. no rate_limits
+/// block for unauthenticated or fresh sessions).
+#[derive(Clone, Debug, Serialize)]
+struct SessionStats {
+    model_display: Option<String>,
+    ctx_pct: Option<f32>,
+    five_hr_pct: Option<f32>,
+    seven_day_pct: Option<f32>,
+    updated_at: DateTime<Utc>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 struct Session {
     id: String,
@@ -76,6 +123,11 @@ struct Session {
     /// Only populated for Codex sessions (`cx`); Claude uses transcript tail.
     #[serde(skip)]
     output_partial: String,
+    /// Whatever interactive prompt claude is currently blocked on. Cleared
+    /// on SessionStart/UserPromptSubmit/Stop and on matching tool_result.
+    pending_prompt: Option<PendingPrompt>,
+    /// Latest statusline snapshot — model name + context/5h/7d usage.
+    stats: Option<SessionStats>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -111,6 +163,8 @@ impl Session {
             tty: None,
             term_program: None,
             output_partial: String::new(),
+            pending_prompt: None,
+            stats: None,
         }
     }
 }
@@ -135,6 +189,49 @@ struct HookPayload {
     #[allow(dead_code)]
     #[serde(default)]
     hook_event_name: Option<String>,
+    /// Notification hook: human-readable message ("Claude needs your
+    /// permission to use Bash" / "Claude is waiting for your input" / ...).
+    #[serde(default)]
+    message: Option<String>,
+    /// Notification hook: machine-readable kind — `permission_prompt`,
+    /// `idle_prompt`, or something we haven't seen yet.
+    #[serde(default)]
+    notification_type: Option<String>,
+}
+
+/// Claude Code statusline stdin JSON — only the fields we care about. Everything
+/// is optional because Anthropic sometimes omits blocks on fresh / unauthenticated
+/// sessions and we don't want serde to reject the whole payload for a missing
+/// field.
+#[derive(Deserialize, Debug)]
+struct StatuslinePayload {
+    session_id: String,
+    #[serde(default)]
+    model: Option<StatuslineModel>,
+    #[serde(default)]
+    context_window: Option<PctBlock>,
+    #[serde(default)]
+    rate_limits: Option<StatuslineRateLimits>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+struct StatuslineModel {
+    #[serde(default)]
+    display_name: Option<String>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+struct PctBlock {
+    #[serde(default)]
+    used_percentage: Option<f32>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+struct StatuslineRateLimits {
+    #[serde(default)]
+    five_hour: Option<PctBlock>,
+    #[serde(default)]
+    seven_day: Option<PctBlock>,
 }
 
 async fn handle_hook(
@@ -211,9 +308,42 @@ async fn handle_hook(
             && prev_tp.as_ref() != payload.transcript_path.as_ref();
 
         match event.as_str() {
-            "SessionStart" | "UserPromptSubmit" => session.status = Status::Running,
-            "Notification" => session.status = Status::NeedsApproval,
-            "Stop" => session.status = Status::Done,
+            "SessionStart" | "UserPromptSubmit" => {
+                session.status = Status::Running;
+                // Fresh user activity — any prior blocking prompt is moot.
+                session.pending_prompt = None;
+            }
+            "Notification" => {
+                let msg = payload.message.clone().unwrap_or_default();
+                match payload.notification_type.as_deref() {
+                    Some("permission_prompt") => {
+                        session.status = Status::NeedsApproval;
+                        // "needs your approval for the plan" is a 3-choice
+                        // auto-mode picker, not a tool permission — split it
+                        // out so the HUD can label + route correctly.
+                        session.pending_prompt = Some(if msg.contains("approval for the plan") {
+                            PendingPrompt::PlanApproval { message: msg }
+                        } else {
+                            PendingPrompt::Permission { message: msg }
+                        });
+                    }
+                    Some("idle_prompt") => {
+                        // Idle is a passive hint, not a blocking action. Drop
+                        // to Idle status but keep any AskUserQuestion etc.
+                        // that might still be live from the transcript side.
+                        session.status = Status::Idle;
+                    }
+                    _ => {
+                        // Elicitation dialog / unknown — surface raw text
+                        // but don't claim we know how to respond.
+                        session.pending_prompt = Some(PendingPrompt::Raw { message: msg });
+                    }
+                }
+            }
+            "Stop" => {
+                session.status = Status::Done;
+                session.pending_prompt = None;
+            }
             _ => {}
         }
     }
@@ -232,6 +362,39 @@ async fn handle_hook(
         });
     }
 
+    StatusCode::OK
+}
+
+/// Receive the Claude Code statusline stdin JSON (tee'd from the user's
+/// statusline-command.sh) and stash the extracted percentages on the matching
+/// session. Creates a stub Session if we haven't seen SessionStart yet —
+/// statusline can fire before hook wiring is complete on the very first turn.
+async fn handle_statusline(
+    State(state): State<AppState>,
+    Json(p): Json<StatuslinePayload>,
+) -> StatusCode {
+    let stats = SessionStats {
+        model_display: p.model.and_then(|m| m.display_name),
+        ctx_pct: p.context_window.and_then(|c| c.used_percentage),
+        five_hr_pct: p
+            .rate_limits
+            .as_ref()
+            .and_then(|r| r.five_hour.as_ref().and_then(|b| b.used_percentage)),
+        seven_day_pct: p
+            .rate_limits
+            .as_ref()
+            .and_then(|r| r.seven_day.as_ref().and_then(|b| b.used_percentage)),
+        updated_at: Utc::now(),
+    };
+    let mut reg = state.registry.write();
+    if let Some(s) = reg.get_mut(&p.session_id) {
+        s.stats = Some(stats);
+        s.last_event_at = Utc::now();
+    } else {
+        let mut session = Session::new(p.session_id.clone());
+        session.stats = Some(stats);
+        reg.insert(p.session_id, session);
+    }
     StatusCode::OK
 }
 
@@ -655,6 +818,7 @@ async fn read_new_lines(
     let mut reader = BufReader::new(file);
 
     let mut new_messages = Vec::new();
+    let mut new_events: Vec<PromptEvent> = Vec::new();
     let mut new_pos = bytes_read;
     let mut line = String::new();
 
@@ -669,12 +833,14 @@ async fn read_new_lines(
             break;
         }
         new_pos += n as u64;
-        if let Some(msg) = parse_jsonl_line(line.trim()) {
+        let (msg, mut evs) = parse_jsonl_line(line.trim());
+        if let Some(msg) = msg {
             new_messages.push(msg);
         }
+        new_events.append(&mut evs);
     }
 
-    if new_pos != bytes_read || !new_messages.is_empty() {
+    if new_pos != bytes_read || !new_messages.is_empty() || !new_events.is_empty() {
         let mut reg = registry.write();
         if let Some(s) = reg.get_mut(session_id) {
             s.bytes_read = new_pos;
@@ -683,40 +849,85 @@ async fn read_new_lines(
                 let drop = s.messages.len() - MAX_MESSAGES_PER_SESSION;
                 s.messages.drain(0..drop);
             }
+            // Apply AskUserQuestion prompt state from this batch: start
+            // events set pending_prompt, a matching tool_result clears it.
+            for ev in new_events {
+                match ev {
+                    PromptEvent::AskStart { tool_use_id, questions } => {
+                        s.pending_prompt = Some(PendingPrompt::Question {
+                            tool_use_id,
+                            questions,
+                        });
+                    }
+                    PromptEvent::ToolResult { tool_use_id } => {
+                        if let Some(PendingPrompt::Question { tool_use_id: pending_id, .. }) =
+                            &s.pending_prompt
+                        {
+                            if pending_id == &tool_use_id {
+                                s.pending_prompt = None;
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
     Ok(())
 }
 
-fn parse_jsonl_line(line: &str) -> Option<Message> {
-    let v: serde_json::Value = serde_json::from_str(line).ok()?;
-    let top_type = v.get("type")?.as_str()?;
+/// Events extracted from transcript tool blocks that affect `pending_prompt`.
+/// Kept separate from `Message` so the tailer can apply them atomically
+/// alongside message appends.
+enum PromptEvent {
+    AskStart {
+        tool_use_id: String,
+        questions: Vec<AskQuestion>,
+    },
+    ToolResult {
+        tool_use_id: String,
+    },
+}
+
+fn parse_jsonl_line(line: &str) -> (Option<Message>, Vec<PromptEvent>) {
+    let empty: (Option<Message>, Vec<PromptEvent>) = (None, Vec::new());
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+        return empty;
+    };
+    let Some(top_type) = v.get("type").and_then(|t| t.as_str()) else {
+        return empty;
+    };
     if top_type != "user" && top_type != "assistant" {
-        return None;
+        return empty;
     }
-    let msg = v.get("message")?;
-    let role = msg.get("role")?.as_str()?.to_string();
+    let Some(msg) = v.get("message") else { return empty };
+    let Some(role) = msg.get("role").and_then(|r| r.as_str()).map(String::from) else {
+        return empty;
+    };
     let timestamp = v
         .get("timestamp")
         .and_then(|t| t.as_str())
         .map(String::from);
 
-    let content = msg.get("content")?;
+    let Some(content) = msg.get("content") else { return empty };
 
     // content can be a plain string (user prompt) or an array of typed blocks
     if let Some(s) = content.as_str() {
-        return Some(Message {
-            role,
-            kind: "text".into(),
-            text: s.to_string(),
-            timestamp,
-        });
+        return (
+            Some(Message {
+                role,
+                kind: "text".into(),
+                text: s.to_string(),
+                timestamp,
+            }),
+            Vec::new(),
+        );
     }
 
-    let blocks = content.as_array()?;
+    let Some(blocks) = content.as_array() else { return empty };
     let mut parts = Vec::new();
     let mut kind = "text";
+    let mut events: Vec<PromptEvent> = Vec::new();
     for block in blocks {
         let bt = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
         match bt {
@@ -730,6 +941,28 @@ fn parse_jsonl_line(line: &str) -> Option<Message> {
                 let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("?");
                 parts.push(format!("[tool: {name}]"));
                 kind = "tool_use";
+                // AskUserQuestion carries a structured question list we can
+                // render natively in the HUD banner.
+                if name == "AskUserQuestion" {
+                    if let (Some(id), Some(questions)) = (
+                        block.get("id").and_then(|i| i.as_str()),
+                        block
+                            .get("input")
+                            .and_then(|inp| inp.get("questions"))
+                            .and_then(|q| q.as_array()),
+                    ) {
+                        let parsed = questions
+                            .iter()
+                            .filter_map(parse_ask_question)
+                            .collect::<Vec<_>>();
+                        if !parsed.is_empty() {
+                            events.push(PromptEvent::AskStart {
+                                tool_use_id: id.to_string(),
+                                questions: parsed,
+                            });
+                        }
+                    }
+                }
             }
             "tool_result" => {
                 let preview = block
@@ -739,20 +972,64 @@ fn parse_jsonl_line(line: &str) -> Option<Message> {
                     .unwrap_or_default();
                 parts.push(format!("[tool result] {preview}"));
                 kind = "tool_result";
+                if let Some(id) = block.get("tool_use_id").and_then(|i| i.as_str()) {
+                    events.push(PromptEvent::ToolResult {
+                        tool_use_id: id.to_string(),
+                    });
+                }
             }
             _ => {}
         }
     }
 
     if parts.is_empty() {
-        return None;
+        return (None, events);
     }
 
-    Some(Message {
-        role,
-        kind: kind.into(),
-        text: parts.join("\n"),
-        timestamp,
+    (
+        Some(Message {
+            role,
+            kind: kind.into(),
+            text: parts.join("\n"),
+            timestamp,
+        }),
+        events,
+    )
+}
+
+fn parse_ask_question(v: &serde_json::Value) -> Option<AskQuestion> {
+    let question = v.get("question")?.as_str()?.to_string();
+    let header = v
+        .get("header")
+        .and_then(|h| h.as_str())
+        .unwrap_or("")
+        .to_string();
+    let multi_select = v
+        .get("multiSelect")
+        .and_then(|m| m.as_bool())
+        .unwrap_or(false);
+    let options = v
+        .get("options")
+        .and_then(|o| o.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|opt| {
+                    let label = opt.get("label")?.as_str()?.to_string();
+                    let description = opt
+                        .get("description")
+                        .and_then(|d| d.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    Some(AskOption { label, description })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(AskQuestion {
+        question,
+        header,
+        options,
+        multi_select,
     })
 }
 
@@ -766,6 +1043,8 @@ struct SessionSummary {
     started_at: DateTime<Utc>,
     message_count: usize,
     wrapper_id: Option<String>,
+    pending_prompt: Option<PendingPrompt>,
+    stats: Option<SessionStats>,
 }
 
 async fn list_sessions(State(state): State<AppState>) -> Json<Vec<SessionSummary>> {
@@ -781,6 +1060,8 @@ async fn list_sessions(State(state): State<AppState>) -> Json<Vec<SessionSummary
             started_at: s.started_at,
             message_count: s.messages.len(),
             wrapper_id: s.wrapper_id.clone(),
+            pending_prompt: s.pending_prompt.clone(),
+            stats: s.stats.clone(),
         })
         .collect();
     sessions.sort_by(|a, b| b.last_event_at.cmp(&a.last_event_at));
@@ -837,6 +1118,7 @@ async fn main() -> Result<()> {
         .route("/sessions/:id/input", post(inject_by_session))
         .route("/sessions/:id/output", post(append_output))
         .route("/sessions/:id/terminate", post(terminate_wrapper))
+        .route("/hook/statusline", post(handle_statusline))
         .route("/hook/:event", post(handle_hook))
         .route("/register", post(register_wrapper))
         .route("/wrappers", get(list_wrappers))
