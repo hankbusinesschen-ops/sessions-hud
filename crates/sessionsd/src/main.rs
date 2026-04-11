@@ -295,6 +295,80 @@ async fn list_wrappers(State(state): State<AppState>) -> Json<Vec<Wrapper>> {
     Json(state.wrappers.read().values().cloned().collect())
 }
 
+/// Drop a session from the in-memory registry without touching the underlying
+/// process. Used by the HUD "Forget" action — useful for hook-only sessions
+/// (native `claude`) the user wants off the list but doesn't want killed.
+/// If the session was bound to a wrapper, the wrapper entry (and its socket
+/// file) go with it.
+async fn forget_session(
+    Path(session_id): Path<String>,
+    State(state): State<AppState>,
+) -> StatusCode {
+    let wrapper_id = state
+        .registry
+        .write()
+        .remove(&session_id)
+        .and_then(|s| s.wrapper_id);
+    if let Some(wid) = wrapper_id {
+        if let Some(w) = state.wrappers.write().remove(&wid) {
+            let _ = std::fs::remove_file(&w.socket_path);
+        }
+    }
+    tracing::info!(session_id = %session_id, "session forgotten");
+    StatusCode::NO_CONTENT
+}
+
+/// SIGTERM the wrapper process (fallback SIGKILL after 3s). Only works for
+/// wrapper-backed sessions — returns 404 otherwise so the HUD can fall back
+/// to Forget.
+async fn terminate_wrapper(
+    Path(session_id): Path<String>,
+    State(state): State<AppState>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let wrapper_id = {
+        let reg = state.registry.read();
+        reg.get(&session_id)
+            .and_then(|s| s.wrapper_id.clone())
+            .ok_or((StatusCode::NOT_FOUND, "session has no wrapper".into()))?
+    };
+    let pid = {
+        let wrappers = state.wrappers.read();
+        wrappers
+            .get(&wrapper_id)
+            .map(|w| w.pid)
+            .ok_or((StatusCode::NOT_FOUND, "wrapper gone".into()))?
+    };
+    // Defence in depth: refuse obviously-wrong pids. kill(0|1|self) would be
+    // catastrophic if state ever got corrupted.
+    if pid <= 1 || pid == std::process::id() {
+        return Err((StatusCode::BAD_REQUEST, format!("refusing to kill pid {pid}")));
+    }
+    let pid_i = pid as i32;
+    unsafe {
+        if libc::kill(pid_i, libc::SIGTERM) != 0 {
+            let e = std::io::Error::last_os_error();
+            // ESRCH = already gone; treat as success and let prune clean up.
+            if e.raw_os_error() != Some(libc::ESRCH) {
+                return Err((StatusCode::BAD_GATEWAY, format!("SIGTERM: {e}")));
+            }
+        }
+    }
+    tracing::info!(wrapper_id = %wrapper_id, pid, "SIGTERM sent");
+    // Escalate to SIGKILL if the wrapper hasn't exited within 3s. The prune
+    // loop handles cleanup either way — this just makes "Terminate" feel
+    // decisive for hung wrappers.
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        unsafe {
+            if libc::kill(pid_i, 0) == 0 {
+                tracing::warn!(pid, "wrapper still alive after SIGTERM — SIGKILL");
+                let _ = libc::kill(pid_i, libc::SIGKILL);
+            }
+        }
+    });
+    Ok(StatusCode::ACCEPTED)
+}
+
 #[derive(Deserialize)]
 struct InjectRequest {
     text: String,
@@ -759,9 +833,10 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/health", get(health))
         .route("/sessions", get(list_sessions))
-        .route("/sessions/:id", get(get_session))
+        .route("/sessions/:id", get(get_session).delete(forget_session))
         .route("/sessions/:id/input", post(inject_by_session))
         .route("/sessions/:id/output", post(append_output))
+        .route("/sessions/:id/terminate", post(terminate_wrapper))
         .route("/hook/:event", post(handle_hook))
         .route("/register", post(register_wrapper))
         .route("/wrappers", get(list_wrappers))

@@ -125,4 +125,48 @@ final class AppModel: ObservableObject {
             self.injectStatus = "inject error: \(error.localizedDescription)"
         }
     }
+
+    /// SIGTERM the wrapper process backing `sessionId`. Daemon escalates to
+    /// SIGKILL after 3s. Only valid for wrapper-backed sessions — the HUD
+    /// already guards this at the UI level.
+    func terminateSession(id: String) async {
+        guard let url = URL(string: "\(daemonBase)/sessions/\(id)/terminate") else { return }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        do {
+            let (_, resp) = try await URLSession.shared.data(for: req)
+            if let http = resp as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+                self.lastError = "terminate failed: HTTP \(http.statusCode)"
+                return
+            }
+            if self.selectedId == id {
+                self.selectedId = nil
+            }
+            await refresh()
+        } catch {
+            self.lastError = "terminate error: \(error.localizedDescription)"
+        }
+    }
+
+    /// Drop the session from the daemon's in-memory registry without killing
+    /// anything. Useful for hook-only sessions (native `claude`) the user just
+    /// wants off the HUD list.
+    func forgetSession(id: String) async {
+        guard let url = URL(string: "\(daemonBase)/sessions/\(id)") else { return }
+        var req = URLRequest(url: url)
+        req.httpMethod = "DELETE"
+        do {
+            let (_, resp) = try await URLSession.shared.data(for: req)
+            if let http = resp as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+                self.lastError = "forget failed: HTTP \(http.statusCode)"
+                return
+            }
+            if self.selectedId == id {
+                self.selectedId = nil
+            }
+            await refresh()
+        } catch {
+            self.lastError = "forget error: \(error.localizedDescription)"
+        }
+    }
 }

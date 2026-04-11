@@ -88,6 +88,15 @@ struct CompactListView: View {
                                     .onTapGesture {
                                         model.selectedId = session.id
                                     }
+                                    .contextMenu {
+                                        Button("Forget session") {
+                                            Task { await model.forgetSession(id: session.id) }
+                                        }
+                                        Button("Terminate (SIGTERM)") {
+                                            confirmAndTerminate(session)
+                                        }
+                                        .disabled(session.wrapperId == nil)
+                                    }
                                 Divider().opacity(0.15)
                             }
                         } header: {
@@ -113,6 +122,18 @@ struct CompactListView: View {
 
     private var groupedSessions: [SessionGroup] {
         SessionGroup.group(model.sessions)
+    }
+
+    private func confirmAndTerminate(_ session: SessionSummary) {
+        let alert = NSAlert()
+        alert.messageText = "Terminate “\(session.name)”?"
+        alert.informativeText = "Sends SIGTERM to the ccw/cxw wrapper process. If it doesn't exit within 3 seconds, the daemon will escalate to SIGKILL."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Terminate")
+        alert.addButton(withTitle: "Cancel")
+        if alert.runModal() == .alertFirstButtonReturn {
+            Task { await model.terminateSession(id: session.id) }
+        }
     }
 }
 
@@ -305,6 +326,18 @@ struct ChatView: View {
             .help("Open in terminal")
 
             Button {
+                confirmAndEnd()
+            } label: {
+                Image(systemName: "trash")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .help(selectedSummary?.wrapperId != nil
+                  ? "Terminate (SIGTERM wrapper)"
+                  : "Forget session (remove from list)")
+
+            Button {
                 NSApp.terminate(nil)
             } label: {
                 Image(systemName: "xmark.circle.fill")
@@ -397,6 +430,30 @@ struct ChatView: View {
         let sid = id
         model.injectDraft = ""
         Task { await model.injectInput(sessionId: sid, text: text) }
+    }
+
+    private func confirmAndEnd() {
+        guard let s = selectedSummary else { return }
+        let alert = NSAlert()
+        if s.wrapperId != nil {
+            alert.messageText = "Terminate “\(s.name)”?"
+            alert.informativeText = "Sends SIGTERM to the ccw/cxw wrapper. If it doesn't exit within 3 seconds, the daemon will escalate to SIGKILL."
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "Terminate")
+            alert.addButton(withTitle: "Cancel")
+            if alert.runModal() == .alertFirstButtonReturn {
+                Task { await model.terminateSession(id: s.id) }
+            }
+        } else {
+            alert.messageText = "Forget “\(s.name)”?"
+            alert.informativeText = "Removes this session from the HUD list. The underlying claude process keeps running."
+            alert.alertStyle = .informational
+            alert.addButton(withTitle: "Forget")
+            alert.addButton(withTitle: "Cancel")
+            if alert.runModal() == .alertFirstButtonReturn {
+                Task { await model.forgetSession(id: s.id) }
+            }
+        }
     }
 }
 
