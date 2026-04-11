@@ -62,6 +62,12 @@ struct Session {
     messages: Vec<Message>,
     /// Set when this session was started inside a `cc` PTY wrapper.
     wrapper_id: Option<String>,
+    /// Controlling tty path of the host terminal (e.g. "/dev/ttys003"), copied
+    /// from the bound wrapper so the HUD can focus the right terminal window.
+    tty: Option<String>,
+    /// $TERM_PROGRAM snapshot ("Apple_Terminal", "iTerm.app", …) for routing
+    /// the "Open in Terminal" AppleScript to the right app.
+    term_program: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -74,6 +80,8 @@ struct Wrapper {
     session_id: Option<String>,
     /// Unix domain socket `cc` binds to receive HUD-injected input.
     socket_path: String,
+    tty: Option<String>,
+    term_program: Option<String>,
     registered_at: DateTime<Utc>,
 }
 
@@ -92,6 +100,8 @@ impl Session {
             bytes_read: 0,
             messages: Vec::new(),
             wrapper_id: None,
+            tty: None,
+            term_program: None,
         }
     }
 }
@@ -138,9 +148,14 @@ async fn handle_hook(
 
     // Look up wrapper name (if any) BEFORE taking the session write lock so
     // we don't hold two locks at once.
-    let wrapper_name = wrapper_id
-        .as_ref()
-        .and_then(|wid| state.wrappers.read().get(wid).map(|w| w.name.clone()));
+    let wrapper_info = wrapper_id.as_ref().and_then(|wid| {
+        state
+            .wrappers
+            .read()
+            .get(wid)
+            .map(|w| (w.name.clone(), w.tty.clone(), w.term_program.clone()))
+    });
+    let wrapper_name = wrapper_info.as_ref().map(|(n, _, _)| n.clone());
 
     let session_id = payload.session_id.clone();
     let needs_new_tailer;
@@ -169,6 +184,14 @@ async fn handle_hook(
         }
         if let Some(ref wid) = wrapper_id {
             session.wrapper_id = Some(wid.clone());
+        }
+        if let Some((_, ref tty, ref tp)) = wrapper_info {
+            if tty.is_some() {
+                session.tty = tty.clone();
+            }
+            if tp.is_some() {
+                session.term_program = tp.clone();
+            }
         }
 
         let prev_tp = session.transcript_path.clone();
@@ -208,6 +231,10 @@ struct RegisterRequest {
     name: String,
     cwd: String,
     pid: u32,
+    #[serde(default)]
+    tty: Option<String>,
+    #[serde(default)]
+    term_program: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -232,6 +259,8 @@ async fn register_wrapper(
             pid: req.pid,
             session_id: None,
             socket_path: sock.clone(),
+            tty: req.tty,
+            term_program: req.term_program,
             registered_at: Utc::now(),
         },
     );

@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import MarkdownUI
 
 /// Root view — routes between Mode A (compact list) and Mode B (chat).
 struct SessionListView: View {
@@ -78,18 +79,79 @@ struct CompactListView: View {
             .frame(maxWidth: .infinity)
         } else {
             ScrollView {
-                LazyVStack(spacing: 0) {
-                    ForEach(model.sessions) { session in
-                        SessionRow(session: session, now: model.now, selected: false)
-                            .contentShape(Rectangle())
-                            .onTapGesture {
-                                model.selectedId = session.id
+                LazyVStack(spacing: 0, pinnedViews: [.sectionHeaders]) {
+                    ForEach(groupedSessions, id: \.label) { group in
+                        Section {
+                            ForEach(group.sessions) { session in
+                                SessionRow(session: session, now: model.now, selected: false)
+                                    .contentShape(Rectangle())
+                                    .onTapGesture {
+                                        model.selectedId = session.id
+                                    }
+                                Divider().opacity(0.15)
                             }
-                        Divider().opacity(0.15)
+                        } header: {
+                            groupHeader(group.label)
+                        }
                     }
                 }
             }
         }
+    }
+
+    private func groupHeader(_ label: String) -> some View {
+        HStack {
+            Text(label)
+                .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                .foregroundStyle(.tertiary)
+            Spacer()
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 4)
+        .background(.ultraThinMaterial)
+    }
+
+    private var groupedSessions: [SessionGroup] {
+        SessionGroup.group(model.sessions)
+    }
+}
+
+/// Compact-list grouping by repo root. We walk up from each session's cwd
+/// until we find a directory containing `.git` (file or dir, so submodules /
+/// worktrees both work) and use that directory's basename as the group label.
+/// Sessions without a cwd — or whose cwd isn't inside any git repo — fall
+/// into a `"~"` bucket so they still show up.
+struct SessionGroup {
+    let label: String
+    let sessions: [SessionSummary]
+
+    static func group(_ sessions: [SessionSummary]) -> [SessionGroup] {
+        var buckets: [(String, [SessionSummary])] = []
+        for s in sessions {
+            let key = repoRoot(for: s.cwd)
+            if let idx = buckets.firstIndex(where: { $0.0 == key }) {
+                buckets[idx].1.append(s)
+            } else {
+                buckets.append((key, [s]))
+            }
+        }
+        return buckets.map { SessionGroup(label: $0.0, sessions: $0.1) }
+    }
+
+    private static func repoRoot(for cwd: String?) -> String {
+        guard let cwd, !cwd.isEmpty else { return "~" }
+        let fm = FileManager.default
+        var dir = URL(fileURLWithPath: cwd)
+        while dir.path != "/" {
+            let git = dir.appendingPathComponent(".git").path
+            if fm.fileExists(atPath: git) {
+                return dir.lastPathComponent
+            }
+            let parent = dir.deletingLastPathComponent()
+            if parent.path == dir.path { break }
+            dir = parent
+        }
+        return URL(fileURLWithPath: cwd).lastPathComponent
     }
 }
 
@@ -223,6 +285,20 @@ struct ChatView: View {
                 .foregroundStyle(.secondary)
 
             Button {
+                TerminalFocus.openInTerminal(
+                    tty: model.selectedDetail?.tty,
+                    termProgram: model.selectedDetail?.termProgram
+                )
+            } label: {
+                Image(systemName: "arrow.up.right.square")
+                    .font(.system(size: 13))
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .disabled((model.selectedDetail?.tty ?? "").isEmpty)
+            .help("Open in terminal")
+
+            Button {
                 NSApp.terminate(nil)
             } label: {
                 Image(systemName: "xmark.circle.fill")
@@ -320,16 +396,38 @@ struct MessageBubble: View {
                         .foregroundStyle(.tertiary)
                 }
             }
-            Text(message.text)
-                .font(.system(size: 12))
-                .textSelection(.enabled)
-                .fixedSize(horizontal: false, vertical: true)
+            bodyView
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 7)
         .background(bubbleBackground)
         .clipShape(RoundedRectangle(cornerRadius: 6))
+    }
+
+    /// Render assistant / user text as Markdown so code fences, lists, and
+    /// inline code look right. Tool-use / tool-result blocks stay monospaced
+    /// so we don't accidentally interpret their contents (often raw shell
+    /// output or JSON) as markdown.
+    @ViewBuilder
+    private var bodyView: some View {
+        if message.kind == "text" {
+            Markdown(message.text)
+                .markdownTextStyle {
+                    FontSize(12)
+                }
+                .markdownTextStyle(\.code) {
+                    FontFamilyVariant(.monospaced)
+                    FontSize(11)
+                    BackgroundColor(Color.gray.opacity(0.15))
+                }
+                .textSelection(.enabled)
+        } else {
+            Text(message.text)
+                .font(.system(size: 11, design: .monospaced))
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+        }
     }
 
     private var roleLabel: String {

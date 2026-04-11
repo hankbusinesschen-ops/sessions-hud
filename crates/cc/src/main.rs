@@ -50,6 +50,22 @@ struct RegisterRequest<'a> {
     name: &'a str,
     cwd: &'a str,
     pid: u32,
+    tty: Option<String>,
+    term_program: Option<String>,
+}
+
+/// Best-effort lookup of the controlling tty on stdin — used by the HUD's
+/// "Open in Terminal" button to focus the right window via AppleScript.
+fn stdin_tty() -> Option<String> {
+    use std::ffi::CStr;
+    let ptr = unsafe { libc::ttyname(0) };
+    if ptr.is_null() {
+        return None;
+    }
+    let s = unsafe { CStr::from_ptr(ptr) }
+        .to_string_lossy()
+        .into_owned();
+    Some(s)
 }
 
 #[derive(Deserialize)]
@@ -77,6 +93,8 @@ fn register_with_daemon(name: &str, cwd: &str) -> Option<Registration> {
         name,
         cwd,
         pid: std::process::id(),
+        tty: stdin_tty(),
+        term_program: std::env::var("TERM_PROGRAM").ok(),
     };
     let url = format!("{}/register", daemon_url());
     let agent = ureq::AgentBuilder::new()
@@ -207,7 +225,9 @@ fn main() -> Result<()> {
     if let Ok(cwd) = std::env::current_dir() {
         cmd.cwd(cwd);
     }
-    for (k, v) in std::env::vars() {
+    // Use vars_os so a mangled/non-UTF8 env var (e.g. when invoked from a
+    // subshell that misencoded a parent $PWD) doesn't panic the wrapper.
+    for (k, v) in std::env::vars_os() {
         cmd.env(k, v);
     }
     cmd.env("CC_WRAPPER_NAME", &name);

@@ -32,6 +32,8 @@ struct SessionDetail: Codable, Equatable {
     let lastEventAt: Date
     let messages: [SessionMessage]
     let wrapperId: String?
+    let tty: String?
+    let termProgram: String?
 }
 
 struct SessionMessage: Codable, Equatable, Identifiable {

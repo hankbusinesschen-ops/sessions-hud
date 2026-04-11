@@ -21,6 +21,7 @@ final class AppModel: ObservableObject {
     @Published var injectDraft: String = ""
     @Published var injectStatus: String?
 
+    private let notifier = Notifier()
     private var pollTimer: Timer?
     private var clockTimer: Timer?
     private let url = URL(string: "http://127.0.0.1:39501/sessions")!
@@ -67,6 +68,7 @@ final class AppModel: ObservableObject {
             let (data, _) = try await URLSession.shared.data(for: req)
             let list = try decoder.decode([SessionSummary].self, from: data)
             self.sessions = list
+            self.notifier.observe(list)
             self.lastError = nil
         } catch {
             self.lastError = "daemon: \(error.localizedDescription)"
