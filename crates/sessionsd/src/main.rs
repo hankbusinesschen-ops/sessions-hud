@@ -1,9 +1,9 @@
 use anyhow::Result;
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Json},
-    routing::{get, post},
+    routing::{delete, get, post},
     Router,
 };
 use chrono::{DateTime, Utc};
@@ -51,6 +51,19 @@ struct Session {
     #[serde(skip)]
     bytes_read: u64,
     messages: Vec<Message>,
+    /// Set when this session was started inside a `cc` PTY wrapper.
+    wrapper_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct Wrapper {
+    id: String,
+    name: String,
+    cwd: String,
+    pid: u32,
+    /// Bound when the SessionStart hook arrives carrying our wrapper_id.
+    session_id: Option<String>,
+    registered_at: DateTime<Utc>,
 }
 
 impl Session {
@@ -67,15 +80,18 @@ impl Session {
             last_event_at: now,
             bytes_read: 0,
             messages: Vec::new(),
+            wrapper_id: None,
         }
     }
 }
 
 type Registry = Arc<RwLock<HashMap<String, Session>>>;
+type WrapperRegistry = Arc<RwLock<HashMap<String, Wrapper>>>;
 
 #[derive(Clone)]
 struct AppState {
     registry: Registry,
+    wrappers: WrapperRegistry,
 }
 
 #[derive(Deserialize, Debug)]
@@ -94,9 +110,26 @@ struct HookPayload {
 async fn handle_hook(
     Path(event): Path<String>,
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(payload): Json<HookPayload>,
 ) -> impl IntoResponse {
-    tracing::info!(event = %event, session_id = %payload.session_id, "hook");
+    let wrapper_id = headers
+        .get("x-cc-wrapper-id")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+
+    tracing::info!(
+        event = %event,
+        session_id = %payload.session_id,
+        wrapper_id = ?wrapper_id,
+        "hook"
+    );
+
+    // Look up wrapper name (if any) BEFORE taking the session write lock so
+    // we don't hold two locks at once.
+    let wrapper_name = wrapper_id
+        .as_ref()
+        .and_then(|wid| state.wrappers.read().get(wid).map(|w| w.name.clone()));
 
     let session_id = payload.session_id.clone();
     let needs_new_tailer;
@@ -119,6 +152,14 @@ async fn handle_hook(
             }
         }
 
+        // Wrapper name always wins over auto-derived names.
+        if let Some(ref n) = wrapper_name {
+            session.name = n.clone();
+        }
+        if let Some(ref wid) = wrapper_id {
+            session.wrapper_id = Some(wid.clone());
+        }
+
         let prev_tp = session.transcript_path.clone();
         if let Some(ref tp) = payload.transcript_path {
             session.transcript_path = Some(tp.clone());
@@ -134,6 +175,13 @@ async fn handle_hook(
         }
     }
 
+    // Reverse-bind: tell the wrapper which session_id it ended up running.
+    if let Some(wid) = wrapper_id {
+        if let Some(w) = state.wrappers.write().get_mut(&wid) {
+            w.session_id = Some(session_id.clone());
+        }
+    }
+
     if needs_new_tailer {
         let reg = state.registry.clone();
         tokio::spawn(async move {
@@ -142,6 +190,51 @@ async fn handle_hook(
     }
 
     StatusCode::OK
+}
+
+#[derive(Deserialize, Debug)]
+struct RegisterRequest {
+    name: String,
+    cwd: String,
+    pid: u32,
+}
+
+#[derive(Serialize)]
+struct RegisterResponse {
+    wrapper_id: String,
+}
+
+async fn register_wrapper(
+    State(state): State<AppState>,
+    Json(req): Json<RegisterRequest>,
+) -> Json<RegisterResponse> {
+    let id = uuid::Uuid::new_v4().to_string();
+    tracing::info!(wrapper_id = %id, name = %req.name, pid = req.pid, "wrapper registered");
+    state.wrappers.write().insert(
+        id.clone(),
+        Wrapper {
+            id: id.clone(),
+            name: req.name,
+            cwd: req.cwd,
+            pid: req.pid,
+            session_id: None,
+            registered_at: Utc::now(),
+        },
+    );
+    Json(RegisterResponse { wrapper_id: id })
+}
+
+async fn unregister_wrapper(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+) -> StatusCode {
+    let removed = state.wrappers.write().remove(&id);
+    tracing::info!(wrapper_id = %id, found = removed.is_some(), "wrapper unregistered");
+    StatusCode::OK
+}
+
+async fn list_wrappers(State(state): State<AppState>) -> Json<Vec<Wrapper>> {
+    Json(state.wrappers.read().values().cloned().collect())
 }
 
 async fn tail_session(registry: Registry, session_id: String) {
@@ -303,6 +396,7 @@ struct SessionSummary {
     last_event_at: DateTime<Utc>,
     started_at: DateTime<Utc>,
     message_count: usize,
+    wrapper_id: Option<String>,
 }
 
 async fn list_sessions(State(state): State<AppState>) -> Json<Vec<SessionSummary>> {
@@ -317,6 +411,7 @@ async fn list_sessions(State(state): State<AppState>) -> Json<Vec<SessionSummary
             last_event_at: s.last_event_at,
             started_at: s.started_at,
             message_count: s.messages.len(),
+            wrapper_id: s.wrapper_id.clone(),
         })
         .collect();
     sessions.sort_by(|a, b| b.last_event_at.cmp(&a.last_event_at));
@@ -351,6 +446,7 @@ async fn main() -> Result<()> {
 
     let state = AppState {
         registry: Arc::new(RwLock::new(HashMap::new())),
+        wrappers: Arc::new(RwLock::new(HashMap::new())),
     };
 
     let app = Router::new()
@@ -358,6 +454,9 @@ async fn main() -> Result<()> {
         .route("/sessions", get(list_sessions))
         .route("/sessions/:id", get(get_session))
         .route("/hook/:event", post(handle_hook))
+        .route("/register", post(register_wrapper))
+        .route("/wrappers", get(list_wrappers))
+        .route("/wrappers/:id", delete(unregister_wrapper))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(LISTEN_ADDR).await?;

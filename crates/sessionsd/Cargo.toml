@@ -16,3 +16,4 @@ notify = "6"
 anyhow = "1"
 parking_lot = "0.12"
 chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }

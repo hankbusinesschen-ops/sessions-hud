@@ -8,6 +8,7 @@ struct SessionSummary: Codable, Identifiable, Equatable {
     let lastEventAt: Date
     let startedAt: Date
     let messageCount: Int
+    let wrapperId: String?
 
     enum Status: String, Codable {
         case running

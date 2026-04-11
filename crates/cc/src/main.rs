@@ -13,10 +13,12 @@
 use anyhow::{Context, Result};
 use crossterm::terminal;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use serde::{Deserialize, Serialize};
 use signal_hook::{consts::SIGWINCH, iterator::Signals};
 use std::io::{IsTerminal, Read, Write};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 /// Restores cooked mode on drop, no matter how we exit. A no-op when stdin
 /// isn't a tty (e.g. piped input, or running under Claude Code's Bash tool).
@@ -41,6 +43,60 @@ impl Drop for RawModeGuard {
     }
 }
 
+#[derive(Serialize)]
+struct RegisterRequest<'a> {
+    name: &'a str,
+    cwd: &'a str,
+    pid: u32,
+}
+
+#[derive(Deserialize)]
+struct RegisterResponse {
+    wrapper_id: String,
+}
+
+fn daemon_url() -> String {
+    std::env::var("SESSIONSD_URL").unwrap_or_else(|_| "http://127.0.0.1:39501".into())
+}
+
+/// Try to register with sessionsd. Soft-fails: if the daemon isn't up, cc
+/// still works as a transparent passthrough — you just don't get the named
+/// session in the HUD.
+fn register_with_daemon(name: &str, cwd: &str) -> Option<String> {
+    let req = RegisterRequest {
+        name,
+        cwd,
+        pid: std::process::id(),
+    };
+    let url = format!("{}/register", daemon_url());
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_millis(500))
+        .timeout(Duration::from_millis(1000))
+        .build();
+    match agent.post(&url).send_json(serde_json::to_value(&req).ok()?) {
+        Ok(resp) => match resp.into_json::<RegisterResponse>() {
+            Ok(r) => Some(r.wrapper_id),
+            Err(e) => {
+                eprintln!("cc: register decode failed: {e}");
+                None
+            }
+        },
+        Err(e) => {
+            eprintln!("cc: sessionsd not reachable ({e}) — running unattached");
+            None
+        }
+    }
+}
+
+fn unregister_from_daemon(wrapper_id: &str) {
+    let url = format!("{}/wrappers/{}", daemon_url(), wrapper_id);
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_millis(500))
+        .timeout(Duration::from_millis(1000))
+        .build();
+    let _ = agent.delete(&url).call();
+}
+
 fn parse_args() -> (String, Vec<String>) {
     let mut args = std::env::args().skip(1);
     let name = args.next().unwrap_or_else(|| "unnamed".into());
@@ -57,6 +113,14 @@ fn main() -> Result<()> {
 
     // Resolve target program. Override with $CC_WRAPPER_TARGET for testing.
     let target = std::env::var("CC_WRAPPER_TARGET").unwrap_or_else(|_| "claude".to_string());
+
+    // Register with sessionsd so the HUD can show the user-chosen name
+    // instead of the cwd basename. Soft-fails if the daemon is down.
+    let cwd_str = std::env::current_dir()
+        .ok()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let wrapper_id = register_with_daemon(&name, &cwd_str);
 
     // Detect host terminal size; fall back to 80x24 if we're not on a tty.
     let (cols, rows) = terminal::size().unwrap_or((80, 24));
@@ -85,6 +149,9 @@ fn main() -> Result<()> {
         cmd.env(k, v);
     }
     cmd.env("CC_WRAPPER_NAME", &name);
+    if let Some(ref id) = wrapper_id {
+        cmd.env("CC_WRAPPER_ID", id);
+    }
 
     let mut child = pair
         .slave
@@ -171,6 +238,10 @@ fn main() -> Result<()> {
     let status = child.wait().context("child wait")?;
     drop(_raw);
     let _ = out_thread.join();
+
+    if let Some(ref id) = wrapper_id {
+        unregister_from_daemon(id);
+    }
 
     let code = if status.success() { 0 } else { status.exit_code() as i32 };
     std::process::exit(code);

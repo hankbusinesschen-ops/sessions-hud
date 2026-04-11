@@ -23,10 +23,18 @@ if [ "$EVENT" = "Notification" ]; then
     } >> "$DEBUG_LOG" 2>/dev/null || true
 fi
 
+# If we were spawned under a `cc` PTY wrapper, propagate its id so the
+# daemon can map session_id ↔ wrapper and use the user's chosen name.
+WRAPPER_HEADER=()
+if [ -n "${CC_WRAPPER_ID:-}" ]; then
+    WRAPPER_HEADER=(-H "X-Cc-Wrapper-Id: ${CC_WRAPPER_ID}")
+fi
+
 curl --silent --show-error --fail \
     --max-time 1 \
     --connect-timeout 1 \
     -H 'Content-Type: application/json' \
+    "${WRAPPER_HEADER[@]}" \
     -X POST \
     --data "$PAYLOAD" \
     "${DAEMON_URL}/hook/${EVENT}" \
