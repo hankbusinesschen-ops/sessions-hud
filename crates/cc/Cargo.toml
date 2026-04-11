@@ -1,0 +1,16 @@
+[package]
+name = "cc-wrapper"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "cc"
+path = "src/main.rs"
+
+[dependencies]
+portable-pty = "0.8"
+crossterm = "0.27"
+signal-hook = "0.3"
+anyhow = "1"
