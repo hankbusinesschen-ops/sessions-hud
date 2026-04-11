@@ -3,11 +3,13 @@ use axum::{
     body::Bytes,
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
+    response::sse::{Event, KeepAlive, Sse},
     response::{IntoResponse, Json},
     routing::{delete, get, post},
     Router,
 };
 use chrono::{DateTime, Utc};
+use futures::stream::Stream;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -16,6 +18,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::fs::File;
 use tokio::io::{AsyncBufReadExt, AsyncSeekExt, BufReader, SeekFrom};
+use tokio::sync::broadcast;
+use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::StreamExt;
 
 const LISTEN_ADDR: &str = "127.0.0.1:39501";
 const TAIL_INTERVAL: Duration = Duration::from_millis(500);
@@ -172,10 +177,37 @@ impl Session {
 type Registry = Arc<RwLock<HashMap<String, Session>>>;
 type WrapperRegistry = Arc<RwLock<HashMap<String, Wrapper>>>;
 
+/// Broadcast event pushed to all `/events` SSE subscribers when the session
+/// registry mutates. HUD clients react by refetching the affected slice.
+/// We intentionally do NOT ship full session bodies over the wire here — the
+/// snapshot routes (`/sessions`, `/sessions/:id`) remain the source of truth,
+/// and SSE just carries cache-invalidation hints.
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum SseEvent {
+    /// The session list changed (add / remove / status transition). Clients
+    /// should refetch `GET /sessions`.
+    SessionsChanged,
+    /// Detail of one session changed (messages appended, pending_prompt flip,
+    /// stats update). Clients should refetch `GET /sessions/<id>` if they're
+    /// displaying that session.
+    SessionUpdated { id: String },
+}
+
 #[derive(Clone)]
 struct AppState {
     registry: Registry,
     wrappers: WrapperRegistry,
+    tx: broadcast::Sender<SseEvent>,
+}
+
+impl AppState {
+    fn notify_list(&self) {
+        let _ = self.tx.send(SseEvent::SessionsChanged);
+    }
+    fn notify_one(&self, id: &str) {
+        let _ = self.tx.send(SseEvent::SessionUpdated { id: id.to_string() });
+    }
 }
 
 #[derive(Deserialize, Debug)]
@@ -357,10 +389,18 @@ async fn handle_hook(
 
     if needs_new_tailer {
         let reg = state.registry.clone();
+        let tx_clone = state.tx.clone();
+        let sid = session_id.clone();
         tokio::spawn(async move {
-            tail_session(reg, session_id).await;
+            tail_session(reg, tx_clone, sid).await;
         });
     }
+
+    // A hook event always changes both list-level state (status, last_event_at)
+    // and per-session detail (pending_prompt). Emit both so HUD subscribers
+    // can refresh whichever slice they're displaying.
+    state.notify_list();
+    state.notify_one(&session_id);
 
     StatusCode::OK
 }
@@ -386,15 +426,25 @@ async fn handle_statusline(
             .and_then(|r| r.seven_day.as_ref().and_then(|b| b.used_percentage)),
         updated_at: Utc::now(),
     };
-    let mut reg = state.registry.write();
-    if let Some(s) = reg.get_mut(&p.session_id) {
-        s.stats = Some(stats);
-        s.last_event_at = Utc::now();
-    } else {
-        let mut session = Session::new(p.session_id.clone());
-        session.stats = Some(stats);
-        reg.insert(p.session_id, session);
+    let sid_for_event = p.session_id.clone();
+    let was_new;
+    {
+        let mut reg = state.registry.write();
+        if let Some(s) = reg.get_mut(&p.session_id) {
+            s.stats = Some(stats);
+            s.last_event_at = Utc::now();
+            was_new = false;
+        } else {
+            let mut session = Session::new(p.session_id.clone());
+            session.stats = Some(stats);
+            reg.insert(p.session_id, session);
+            was_new = true;
+        }
     }
+    if was_new {
+        state.notify_list();
+    }
+    state.notify_one(&sid_for_event);
     StatusCode::OK
 }
 
@@ -478,6 +528,7 @@ async fn forget_session(
         }
     }
     tracing::info!(session_id = %session_id, "session forgotten");
+    state.notify_list();
     StatusCode::NO_CONTENT
 }
 
@@ -652,13 +703,15 @@ async fn append_output(
         return StatusCode::OK;
     }
 
-    let mut reg = state.registry.write();
-    let Some(session) = reg.get_mut(&session_id) else {
-        return StatusCode::NOT_FOUND;
-    };
+    let mut appended_any = false;
+    {
+        let mut reg = state.registry.write();
+        let Some(session) = reg.get_mut(&session_id) else {
+            return StatusCode::NOT_FOUND;
+        };
 
-    session.last_event_at = Utc::now();
-    session.output_partial.push_str(&cleaned);
+        session.last_event_at = Utc::now();
+        session.output_partial.push_str(&cleaned);
 
     // Split on newline; last element (if partial) stays buffered.
     let mut lines: Vec<String> = session
@@ -674,20 +727,26 @@ async fn append_output(
         lines.push(forced);
     }
 
-    for line in lines {
-        if line.is_empty() {
-            continue;
+        for line in lines {
+            if line.is_empty() {
+                continue;
+            }
+            session.messages.push(Message {
+                role: "assistant".into(),
+                kind: "text".into(),
+                text: line,
+                timestamp: Some(Utc::now().to_rfc3339()),
+            });
+            appended_any = true;
         }
-        session.messages.push(Message {
-            role: "assistant".into(),
-            kind: "text".into(),
-            text: line,
-            timestamp: Some(Utc::now().to_rfc3339()),
-        });
+        if session.messages.len() > MAX_MESSAGES_PER_SESSION {
+            let drop = session.messages.len() - MAX_MESSAGES_PER_SESSION;
+            session.messages.drain(0..drop);
+        }
     }
-    if session.messages.len() > MAX_MESSAGES_PER_SESSION {
-        let drop = session.messages.len() - MAX_MESSAGES_PER_SESSION;
-        session.messages.drain(0..drop);
+
+    if appended_any {
+        state.notify_one(&session_id);
     }
 
     StatusCode::OK
@@ -755,6 +814,7 @@ async fn prune_dead_wrappers(state: AppState) {
         }
 
         // Mark each orphaned session as exited so the HUD can show 🔴.
+        let mut touched: Vec<String> = Vec::new();
         {
             let mut reg = state.registry.write();
             for (_, sid, _) in &dead {
@@ -762,14 +822,25 @@ async fn prune_dead_wrappers(state: AppState) {
                     if let Some(s) = reg.get_mut(sid) {
                         s.status = Status::Exited;
                         s.last_event_at = Utc::now();
+                        touched.push(sid.clone());
                     }
                 }
+            }
+        }
+        if !touched.is_empty() {
+            state.notify_list();
+            for sid in &touched {
+                state.notify_one(sid);
             }
         }
     }
 }
 
-async fn tail_session(registry: Registry, session_id: String) {
+async fn tail_session(
+    registry: Registry,
+    tx: broadcast::Sender<SseEvent>,
+    session_id: String,
+) {
     let path = {
         let reg = registry.read();
         reg.get(&session_id).and_then(|s| s.transcript_path.clone())
@@ -779,8 +850,14 @@ async fn tail_session(registry: Registry, session_id: String) {
     tracing::info!(session_id = %session_id, ?path, "tailer started");
 
     loop {
-        if let Err(e) = read_new_lines(&registry, &session_id, &path).await {
-            tracing::warn!(session_id = %session_id, err = %e, "tail read error");
+        match read_new_lines(&registry, &session_id, &path).await {
+            Ok(true) => {
+                let _ = tx.send(SseEvent::SessionUpdated { id: session_id.clone() });
+            }
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(session_id = %session_id, err = %e, "tail read error");
+            }
         }
 
         let still_present = registry.read().contains_key(&session_id);
@@ -797,7 +874,7 @@ async fn read_new_lines(
     registry: &Registry,
     session_id: &str,
     path: &std::path::Path,
-) -> Result<()> {
+) -> Result<bool> {
     let bytes_read = registry
         .read()
         .get(session_id)
@@ -806,11 +883,11 @@ async fn read_new_lines(
 
     let metadata = match tokio::fs::metadata(path).await {
         Ok(m) => m,
-        Err(_) => return Ok(()), // file not yet created
+        Err(_) => return Ok(false), // file not yet created
     };
 
     if metadata.len() <= bytes_read {
-        return Ok(());
+        return Ok(false);
     }
 
     let mut file = File::open(path).await?;
@@ -840,7 +917,8 @@ async fn read_new_lines(
         new_events.append(&mut evs);
     }
 
-    if new_pos != bytes_read || !new_messages.is_empty() || !new_events.is_empty() {
+    let had_update = new_pos != bytes_read || !new_messages.is_empty() || !new_events.is_empty();
+    if had_update {
         let mut reg = registry.write();
         if let Some(s) = reg.get_mut(session_id) {
             s.bytes_read = new_pos;
@@ -873,7 +951,7 @@ async fn read_new_lines(
         }
     }
 
-    Ok(())
+    Ok(had_update)
 }
 
 /// Events extracted from transcript tool blocks that affect `pending_prompt`.
@@ -1085,6 +1163,29 @@ async fn health() -> &'static str {
     "ok"
 }
 
+/// SSE endpoint: clients subscribe here to receive cache-invalidation events
+/// as soon as they happen instead of polling `/sessions` on a timer. The
+/// stream also emits a synthetic `hello` event immediately so clients know
+/// the connection is live before any real event fires, plus a 15-second
+/// heartbeat comment to keep NAT / HTTP proxies from reaping the socket.
+async fn sse_events(
+    State(state): State<AppState>,
+) -> Sse<impl Stream<Item = Result<Event, axum::Error>>> {
+    let rx = state.tx.subscribe();
+    let hello = futures::stream::once(async {
+        Ok(Event::default().event("hello").data("{}"))
+    });
+    let live = BroadcastStream::new(rx).filter_map(|res| match res {
+        Ok(ev) => serde_json::to_string(&ev)
+            .ok()
+            .map(|json| Ok(Event::default().data(json))),
+        // Lagged: client was too slow. Silently drop — the HUD will refresh
+        // its snapshot on the next event or on reconnect.
+        Err(_) => None,
+    });
+    Sse::new(hello.chain(live)).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -1103,9 +1204,11 @@ async fn main() -> Result<()> {
         let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
     }
 
+    let (tx, _rx) = broadcast::channel::<SseEvent>(256);
     let state = AppState {
         registry: Arc::new(RwLock::new(HashMap::new())),
         wrappers: Arc::new(RwLock::new(HashMap::new())),
+        tx,
     };
 
     // Background task: prune wrappers whose PID has gone away.
@@ -1113,6 +1216,7 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/health", get(health))
+        .route("/events", get(sse_events))
         .route("/sessions", get(list_sessions))
         .route("/sessions/:id", get(get_session).delete(forget_session))
         .route("/sessions/:id/input", post(inject_by_session))

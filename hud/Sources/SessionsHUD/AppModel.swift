@@ -24,8 +24,8 @@ final class AppModel: ObservableObject {
     @Published var injectStatus: String?
 
     private let notifier = Notifier()
-    private var pollTimer: Timer?
     private var clockTimer: Timer?
+    private var events: EventStreamClient?
     private let url = URL(string: "http://127.0.0.1:39501/sessions")!
     private let daemonBase = "http://127.0.0.1:39501"
 
@@ -66,18 +66,50 @@ final class AppModel: ObservableObject {
     }
 
     func start() {
-        // poll daemon every 1s
-        pollTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                await self?.refresh()
-                await self?.refreshSelected()
-            }
-        }
-        // tick clock every 1s so relative times update even when sessions[] is unchanged
+        // Relative-time label tick (independent of session updates so "2m ago"
+        // still counts up when nothing is happening).
         clockTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.now = Date() }
         }
         Task { await refresh() }
+
+        let eventsURL = URL(string: "\(daemonBase)/events")!
+        let client = EventStreamClient(url: eventsURL)
+        events = client
+        Task { [weak self] in
+            // Capture once inside the Task so the closures below capture a
+            // let (Sendable under Swift 6) instead of the mutable `self?`
+            // reference that came in from the outer scope.
+            let owner = self
+            await client.start(
+                onConnect: {
+                    await owner?.refresh()
+                    await owner?.refreshSelected()
+                },
+                onEvent: { ev in
+                    await owner?.handleEvent(ev)
+                }
+            )
+        }
+    }
+
+    private func handleEvent(_ ev: SseEvent) async {
+        switch ev {
+        case .sessionsChanged:
+            await refresh()
+            if selectedId != nil {
+                await refreshSelected()
+            }
+        case .sessionUpdated(let id):
+            if id == selectedId {
+                await refreshSelected()
+            }
+            // Also refresh the list so status / last_event_at / pending_prompt
+            // on the compact row flip in lockstep.
+            await refresh()
+        case .unknown:
+            break
+        }
     }
 
     func refresh() async {
