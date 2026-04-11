@@ -10,9 +10,11 @@ final class AppModel: ObservableObject {
         didSet {
             if selectedId == nil {
                 selectedDetail = nil
+                injectStatus = nil
             } else if selectedId != oldValue {
-                // Clear any stale detail from the previous selection.
+                // Clear any stale detail + error from the previous selection.
                 selectedDetail = nil
+                injectStatus = nil
                 Task { await refreshSelected() }
             }
         }
