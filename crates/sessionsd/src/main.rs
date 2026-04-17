@@ -329,18 +329,49 @@ async fn handle_hook(
         return StatusCode::OK;
     }
 
-    // Look up wrapper name (if any) BEFORE taking the session write lock so
-    // we don't hold two locks at once.
+    // Look up wrapper name + currently-bound session_id (if any) BEFORE taking
+    // the session write lock so we don't hold two locks at once. The bound id
+    // is either the placeholder that `register_wrapper` seeded, or the real
+    // session_id from a prior hook in this session — drives the re-key below.
     let wrapper_info = wrapper_id.as_ref().and_then(|wid| {
-        state
-            .wrappers
-            .read()
-            .get(wid)
-            .map(|w| (w.name.clone(), w.tty.clone(), w.term_program.clone()))
+        state.wrappers.read().get(wid).map(|w| {
+            (
+                w.name.clone(),
+                w.tty.clone(),
+                w.term_program.clone(),
+                w.session_id.clone(),
+            )
+        })
     });
-    let wrapper_name = wrapper_info.as_ref().map(|(n, _, _)| n.clone());
+    let wrapper_name = wrapper_info.as_ref().map(|(n, _, _, _)| n.clone());
+    let wrapper_bound_sid = wrapper_info.as_ref().and_then(|(_, _, _, s)| s.clone());
 
     let session_id = payload.session_id.clone();
+
+    // Placeholder migration: if the wrapper was pre-bound to a placeholder
+    // session (typically id == wrapper_id) and the real SessionStart now
+    // arrives carrying a different session_id, re-key the existing entry so
+    // the HUD doesn't see a duplicate. Done up-front so the `or_insert_with`
+    // below finds the migrated session at the real id.
+    if let (Some(ref wid), Some(ref placeholder_id)) = (&wrapper_id, &wrapper_bound_sid) {
+        if placeholder_id != &session_id {
+            let mut reg = state.registry.write();
+            if let Some(mut migrated) = reg.remove(placeholder_id) {
+                migrated.id = session_id.clone();
+                reg.insert(session_id.clone(), migrated);
+                drop(reg);
+                if let Some(w) = state.wrappers.write().get_mut(wid) {
+                    w.session_id = Some(session_id.clone());
+                }
+                tracing::info!(
+                    wrapper_id = %wid,
+                    from = %placeholder_id,
+                    to = %session_id,
+                    "migrated placeholder session to real id"
+                );
+            }
+        }
+    }
     let needs_new_tailer;
     // Tool-use hooks fire many times per second. We still broadcast the
     // list-level `SessionsChanged` (last_event_at moved, sort order might
@@ -374,7 +405,7 @@ async fn handle_hook(
         if let Some(ref wid) = wrapper_id {
             session.wrapper_id = Some(wid.clone());
         }
-        if let Some((_, ref tty, ref tp)) = wrapper_info {
+        if let Some((_, ref tty, ref tp, _)) = wrapper_info {
             if tty.is_some() {
                 session.tty = tty.clone();
             }
@@ -599,6 +630,23 @@ async fn register_wrapper(
     let id = uuid::Uuid::new_v4().to_string();
     let sock = wrapper_socket_path(&id).to_string_lossy().to_string();
     tracing::info!(wrapper_id = %id, name = %req.name, pid = req.pid, socket = %sock, "wrapper registered");
+
+    // Bind the wrapper to a placeholder session keyed by wrapper_id so the HUD
+    // sees the row the instant `ccw` / `cxw` starts — before claude's
+    // SessionStart hook fires (or at all, if hooks are broken). When the real
+    // SessionStart arrives with a different session_id, `handle_hook` will
+    // re-key this entry to the real id in one atomic swap.
+    let now = Utc::now();
+    let mut placeholder = Session::new(id.clone());
+    placeholder.name = req.name.clone();
+    placeholder.cwd = Some(req.cwd.clone());
+    placeholder.status = Status::Running;
+    placeholder.wrapper_id = Some(id.clone());
+    placeholder.tty = req.tty.clone();
+    placeholder.term_program = req.term_program.clone();
+    placeholder.started_at = now;
+    placeholder.last_event_at = now;
+
     state.wrappers.write().insert(
         id.clone(),
         Wrapper {
@@ -606,13 +654,18 @@ async fn register_wrapper(
             name: req.name,
             cwd: req.cwd,
             pid: req.pid,
-            session_id: None,
+            // Pre-bind to the placeholder so prune_dead_wrappers can mark the
+            // right session Exited if the wrapper dies before any hook fires.
+            session_id: Some(id.clone()),
             socket_path: sock.clone(),
             tty: req.tty,
             term_program: req.term_program,
-            registered_at: Utc::now(),
+            registered_at: now,
         },
     );
+    state.registry.write().insert(id.clone(), placeholder);
+    state.notify_list();
+
     Json(RegisterResponse {
         wrapper_id: id,
         socket_path: sock,

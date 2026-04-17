@@ -294,11 +294,14 @@ pub fn run(flavor: Flavor) -> Result<()> {
     let registration = register_with_daemon(&name, &cwd_str);
 
     // Codex has no hook system, so `cx` fabricates a session id + SessionStart
-    // event for the daemon. We keep it alive by firing Stop on exit. The
-    // session_id is a UUID that lives only as long as this wrapper instance.
+    // event for the daemon. We keep it alive by firing Stop on exit. Reuse the
+    // wrapper_id as the synthetic session_id — the daemon already seeded a
+    // placeholder session at id=wrapper_id during `/register`, so the
+    // synthetic SessionStart just lights it up (status=Running) instead of
+    // creating a duplicate entry.
     let synthetic_session_id = if flavor == Flavor::Codex {
         if let Some(ref reg) = registration {
-            let sid = uuid::Uuid::new_v4().to_string();
+            let sid = reg.wrapper_id.clone();
             fire_hook("SessionStart", &reg.wrapper_id, &sid, &cwd_str);
             Some(sid)
         } else {
