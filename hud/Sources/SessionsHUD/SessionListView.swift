@@ -14,6 +14,7 @@ struct SessionListView: View {
                 ChatView()
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(.ultraThinMaterial)
     }
 }
@@ -30,6 +31,10 @@ struct CompactListView: View {
         VStack(alignment: .leading, spacing: 0) {
             header
             Divider().opacity(0.3)
+            if model.connectionState == .disconnected {
+                disconnectedBanner
+                Divider().opacity(0.3)
+            }
             content
             if let err = model.lastError {
                 Divider().opacity(0.3)
@@ -41,13 +46,43 @@ struct CompactListView: View {
                     .padding(.vertical, 4)
             }
         }
-        .frame(minWidth: 280, idealWidth: 280, maxWidth: .infinity,
-               minHeight: 180, idealHeight: 260, maxHeight: .infinity,
-               alignment: .top)
+        .background(Button("") { showLauncher = true }
+            .keyboardShortcut("n", modifiers: .command)
+            .hidden()
+        )
+    }
+
+    private var disconnectedBanner: some View {
+        HStack(spacing: 4) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 10))
+                .foregroundStyle(.orange)
+            Text("sessionsd 未連線")
+                .font(.system(size: 10 * uiScale))
+                .foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 4)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.orange.opacity(0.08))
+    }
+
+    private var connectionDotColor: Color {
+        switch model.connectionState {
+        case .connected:    return .green
+        case .connecting:   return .orange
+        case .disconnected: return .red
+        }
     }
 
     private var header: some View {
         HStack(spacing: 6) {
+            Circle()
+                .fill(connectionDotColor)
+                .frame(width: 7, height: 7)
+                .help(model.connectionState == .connected ? "daemon 已連線"
+                    : model.connectionState == .connecting ? "正在連線…"
+                    : "daemon 未連線")
             Text("Sessions")
                 .font(.system(size: 12 * uiScale, weight: .semibold))
                 .foregroundStyle(.secondary)
@@ -98,11 +133,29 @@ struct CompactListView: View {
     @ViewBuilder
     private var content: some View {
         if model.sessions.isEmpty {
-            VStack {
+            VStack(spacing: 8) {
                 Spacer()
-                Text("no sessions")
-                    .font(.system(size: 11 * uiScale))
-                    .foregroundStyle(.tertiary)
+                if model.connectionState == .disconnected {
+                    Image(systemName: "bolt.horizontal.circle")
+                        .font(.system(size: 24))
+                        .foregroundStyle(.tertiary)
+                    Text("無法連線到 sessionsd")
+                        .font(.system(size: 12 * uiScale, weight: .medium))
+                        .foregroundStyle(.secondary)
+                    Text("請確認 daemon 是否啟動")
+                        .font(.system(size: 10 * uiScale))
+                        .foregroundStyle(.tertiary)
+                } else {
+                    Image(systemName: "terminal")
+                        .font(.system(size: 24))
+                        .foregroundStyle(.tertiary)
+                    Text("尚無工作階段")
+                        .font(.system(size: 12 * uiScale, weight: .medium))
+                        .foregroundStyle(.secondary)
+                    Text("點擊 + 啟動，或在終端機執行 ccw <name>")
+                        .font(.system(size: 10 * uiScale))
+                        .foregroundStyle(.tertiary)
+                }
                 Spacer()
             }
             .frame(maxWidth: .infinity)
@@ -378,9 +431,7 @@ struct ChatView: View {
                     .padding(.vertical, 2)
             }
         }
-        .frame(minWidth: 560, idealWidth: 560, maxWidth: .infinity,
-               minHeight: 640, idealHeight: 640, maxHeight: .infinity,
-               alignment: .top)
+        .onExitCommand { model.selectedId = nil }
     }
 
     private var header: some View {

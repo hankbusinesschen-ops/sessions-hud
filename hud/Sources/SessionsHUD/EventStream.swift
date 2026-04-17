@@ -39,6 +39,7 @@ actor EventStreamClient {
 
     func start(
         onConnect: @escaping @Sendable () async -> Void,
+        onDisconnect: @escaping @Sendable () async -> Void,
         onEvent: @escaping @Sendable (SseEvent) async -> Void
     ) {
         task?.cancel()
@@ -82,6 +83,7 @@ actor EventStreamClient {
                 } catch {
                     // Fall through to backoff — could be daemon restart, NAT
                     // timeout, sleep/wake, anything.
+                    await onDisconnect()
                 }
                 try? await Task.sleep(nanoseconds: backoff)
                 backoff = min(backoff * 2, 10_000_000_000) // cap 10s

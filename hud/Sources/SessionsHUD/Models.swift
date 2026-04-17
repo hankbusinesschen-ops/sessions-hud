@@ -128,10 +128,11 @@ struct SessionMessage: Codable, Equatable, Identifiable {
     let text: String
     let timestamp: String?
 
-    /// Stable enough for ForEach: (timestamp, role, text-hash). Messages are
-    /// append-only in the daemon, so collisions are effectively impossible.
+    /// Stable enough for ForEach: (timestamp, role, kind, length, prefix).
+    /// Messages are append-only in the daemon, so collisions are effectively
+    /// impossible. Avoids `hashValue` which uses a per-launch random seed.
     var id: String {
-        "\(timestamp ?? "")|\(role)|\(kind)|\(text.count)|\(text.hashValue)"
+        "\(timestamp ?? "")|\(role)|\(kind)|\(text.count)|\(text.prefix(80))"
     }
 }
 

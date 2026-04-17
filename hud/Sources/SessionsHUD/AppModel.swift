@@ -1,11 +1,18 @@
 import Foundation
 import Combine
 
+enum ConnectionState: Equatable {
+    case connecting
+    case connected
+    case disconnected
+}
+
 @MainActor
 final class AppModel: ObservableObject {
     @Published var sessions: [SessionSummary] = []
     @Published var lastError: String?
     @Published var now: Date = Date()
+    @Published var connectionState: ConnectionState = .connecting
     @Published var selectedId: String? {
         didSet {
             if selectedId == nil {
@@ -26,8 +33,10 @@ final class AppModel: ObservableObject {
     private let notifier = Notifier()
     private var clockTimer: Timer?
     private var events: EventStreamClient?
-    private let url = URL(string: "http://127.0.0.1:39501/sessions")!
-    private let daemonBase = "http://127.0.0.1:39501"
+    private let daemonBase: String = {
+        ProcessInfo.processInfo.environment["SESSIONSD_URL"] ?? "http://127.0.0.1:39501"
+    }()
+    private var url: URL { URL(string: "\(daemonBase)/sessions")! }
 
     private let decoder: JSONDecoder = {
         let d = JSONDecoder()
@@ -83,14 +92,22 @@ final class AppModel: ObservableObject {
             let owner = self
             await client.start(
                 onConnect: {
+                    await owner?.setConnectionState(.connected)
                     await owner?.refresh()
                     await owner?.refreshSelected()
+                },
+                onDisconnect: {
+                    await owner?.setConnectionState(.disconnected)
                 },
                 onEvent: { ev in
                     await owner?.handleEvent(ev)
                 }
             )
         }
+    }
+
+    private func setConnectionState(_ state: ConnectionState) {
+        self.connectionState = state
     }
 
     private func handleEvent(_ ev: SseEvent) async {
