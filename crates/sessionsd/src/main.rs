@@ -26,6 +26,14 @@ const LISTEN_ADDR: &str = "127.0.0.1:39501";
 const TAIL_INTERVAL: Duration = Duration::from_millis(500);
 const MAX_MESSAGES_PER_SESSION: usize = 500;
 const WRAPPER_PRUNE_INTERVAL: Duration = Duration::from_secs(5);
+/// How often to sweep stale native (hook-only) sessions that never got a
+/// SessionEnd — either because the user SIGKILLed claude or because the
+/// hook missed.
+const NATIVE_SWEEP_INTERVAL: Duration = Duration::from_secs(300); // 5 min
+/// Default age (in hours) after which a quiet native session is considered
+/// stale and eligible for sweeping. Overridable via
+/// `SESSIONSD_NATIVE_STALE_HOURS` for testing / aggressive setups.
+const DEFAULT_NATIVE_STALE_HOURS: f64 = 2.0;
 /// Max bytes we buffer per session while waiting for a line terminator. If a
 /// Codex TUI never emits a newline we don't want to grow unbounded.
 const MAX_PARTIAL_LINE: usize = 16 * 1024;
@@ -133,6 +141,24 @@ struct Session {
     pending_prompt: Option<PendingPrompt>,
     /// Latest statusline snapshot — model name + context/5h/7d usage.
     stats: Option<SessionStats>,
+    /// What tool / subagent / compaction is currently running, if any.
+    /// Set by PreToolUse/SubagentStart/PreCompact, cleared by the matching
+    /// Post*. Also cleared by UserPromptSubmit/Stop as a belt-and-suspenders.
+    current_activity: Option<Activity>,
+}
+
+/// Mirrors the Swift `Activity` enum. JSON tag is "kind" so the shape is
+/// stable even when we add new variants.
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum Activity {
+    Tool { name: String, since: DateTime<Utc> },
+    Subagent {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        since: DateTime<Utc>,
+    },
+    Compacting { since: DateTime<Utc> },
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -170,6 +196,7 @@ impl Session {
             output_partial: String::new(),
             pending_prompt: None,
             stats: None,
+            current_activity: None,
         }
     }
 }
@@ -229,6 +256,14 @@ struct HookPayload {
     /// `idle_prompt`, or something we haven't seen yet.
     #[serde(default)]
     notification_type: Option<String>,
+    /// PreToolUse / PostToolUse: name of the tool about to run / that just ran
+    /// (e.g. "Bash", "Edit", "Agent").
+    #[serde(default)]
+    tool_name: Option<String>,
+    /// SubagentStart / SubagentStop: the subagent kind (e.g. "Explore",
+    /// "general-purpose"). Optional because some Agent invocations omit it.
+    #[serde(default)]
+    subagent_type: Option<String>,
 }
 
 /// Claude Code statusline stdin JSON — only the fields we care about. Everything
@@ -284,6 +319,16 @@ async fn handle_hook(
         "hook"
     );
 
+    // SessionEnd: Claude Code exited gracefully. Short-circuit before the
+    // `or_insert_with` below would otherwise resurrect the entry we're
+    // cleaning up.
+    if event == "SessionEnd" {
+        drop_session(&state, &payload.session_id);
+        tracing::info!(session_id = %payload.session_id, "session ended");
+        state.notify_list();
+        return StatusCode::OK;
+    }
+
     // Look up wrapper name (if any) BEFORE taking the session write lock so
     // we don't hold two locks at once.
     let wrapper_info = wrapper_id.as_ref().and_then(|wid| {
@@ -297,6 +342,12 @@ async fn handle_hook(
 
     let session_id = payload.session_id.clone();
     let needs_new_tailer;
+    // Tool-use hooks fire many times per second. We still broadcast the
+    // list-level `SessionsChanged` (last_event_at moved, sort order might
+    // care), but skip the per-session `SessionUpdated` detail ping unless
+    // `current_activity` actually transitioned. Prevents the HUD ChatView
+    // from refetching on every no-op PreToolUse/PostToolUse.
+    let mut suppress_detail_notify = false;
 
     {
         let mut reg = state.registry.write();
@@ -344,6 +395,9 @@ async fn handle_hook(
                 session.status = Status::Running;
                 // Fresh user activity — any prior blocking prompt is moot.
                 session.pending_prompt = None;
+                // A new turn starts clean — don't leak stale "Bash" chip if
+                // PostToolUse went missing in the previous turn.
+                session.current_activity = None;
             }
             "Notification" => {
                 let msg = payload.message.clone().unwrap_or_default();
@@ -375,6 +429,77 @@ async fn handle_hook(
             "Stop" => {
                 session.status = Status::Done;
                 session.pending_prompt = None;
+                session.current_activity = None;
+            }
+            "PreToolUse" => {
+                let name = payload
+                    .tool_name
+                    .clone()
+                    .unwrap_or_else(|| "tool".to_string());
+                let same = matches!(
+                    &session.current_activity,
+                    Some(Activity::Tool { name: cn, .. }) if cn == &name
+                );
+                if !same {
+                    session.current_activity = Some(Activity::Tool {
+                        name,
+                        since: Utc::now(),
+                    });
+                } else {
+                    suppress_detail_notify = true;
+                }
+            }
+            "PostToolUse" => {
+                // Only clear when the finishing tool_name matches the tool we
+                // currently have recorded. Missing tool_name is treated as a
+                // no-op — without it we can't tell whether this Post belongs
+                // to the Tool currently in `current_activity` or some other
+                // concurrent call.
+                let matches_current = matches!(
+                    (&session.current_activity, payload.tool_name.as_deref()),
+                    (Some(Activity::Tool { name: cn, .. }), Some(finishing)) if cn == finishing
+                );
+                if matches_current {
+                    session.current_activity = None;
+                } else {
+                    suppress_detail_notify = true;
+                }
+            }
+            "SubagentStart" => {
+                let name = payload.subagent_type.clone();
+                let same = matches!(
+                    &session.current_activity,
+                    Some(Activity::Subagent { name: cn, .. }) if cn == &name
+                );
+                if !same {
+                    session.current_activity = Some(Activity::Subagent {
+                        name,
+                        since: Utc::now(),
+                    });
+                } else {
+                    suppress_detail_notify = true;
+                }
+            }
+            "SubagentStop" => {
+                if matches!(session.current_activity, Some(Activity::Subagent { .. })) {
+                    session.current_activity = None;
+                } else {
+                    suppress_detail_notify = true;
+                }
+            }
+            "PreCompact" => {
+                if !matches!(session.current_activity, Some(Activity::Compacting { .. })) {
+                    session.current_activity = Some(Activity::Compacting { since: Utc::now() });
+                } else {
+                    suppress_detail_notify = true;
+                }
+            }
+            "PostCompact" => {
+                if matches!(session.current_activity, Some(Activity::Compacting { .. })) {
+                    session.current_activity = None;
+                } else {
+                    suppress_detail_notify = true;
+                }
             }
             _ => {}
         }
@@ -396,11 +521,13 @@ async fn handle_hook(
         });
     }
 
-    // A hook event always changes both list-level state (status, last_event_at)
-    // and per-session detail (pending_prompt). Emit both so HUD subscribers
-    // can refresh whichever slice they're displaying.
+    // A hook event always changes list-level state (last_event_at drives
+    // sort). Detail ping is suppressed when an activity hook was a no-op —
+    // see `suppress_detail_notify` above.
     state.notify_list();
-    state.notify_one(&session_id);
+    if !suppress_detail_notify {
+        state.notify_one(&session_id);
+    }
 
     StatusCode::OK
 }
@@ -508,25 +635,27 @@ async fn list_wrappers(State(state): State<AppState>) -> Json<Vec<Wrapper>> {
     Json(state.wrappers.read().values().cloned().collect())
 }
 
-/// Drop a session from the in-memory registry without touching the underlying
-/// process. Used by the HUD "Forget" action — useful for hook-only sessions
-/// (native `claude`) the user wants off the list but doesn't want killed.
-/// If the session was bound to a wrapper, the wrapper entry (and its socket
-/// file) go with it.
-async fn forget_session(
-    Path(session_id): Path<String>,
-    State(state): State<AppState>,
-) -> StatusCode {
-    let wrapper_id = state
-        .registry
-        .write()
-        .remove(&session_id)
-        .and_then(|s| s.wrapper_id);
-    if let Some(wid) = wrapper_id {
+/// Remove a session from the registry and (if bound) its wrapper + unix
+/// socket file. Does NOT notify — callers who want HUD updates call
+/// `state.notify_list()` themselves. Returns true if a session was removed.
+fn drop_session(state: &AppState, session_id: &str) -> bool {
+    let Some(removed) = state.registry.write().remove(session_id) else {
+        return false;
+    };
+    if let Some(wid) = removed.wrapper_id {
         if let Some(w) = state.wrappers.write().remove(&wid) {
             let _ = std::fs::remove_file(&w.socket_path);
         }
     }
+    true
+}
+
+/// HUD "Forget" action — drops a session without killing anything.
+async fn forget_session(
+    Path(session_id): Path<String>,
+    State(state): State<AppState>,
+) -> StatusCode {
+    drop_session(&state, &session_id);
     tracing::info!(session_id = %session_id, "session forgotten");
     state.notify_list();
     StatusCode::NO_CONTENT
@@ -836,6 +965,72 @@ async fn prune_dead_wrappers(state: AppState) {
     }
 }
 
+/// Safety net for native (hook-only) sessions the daemon will otherwise
+/// remember forever: a user who SIGKILLs `claude`, force-quits Terminal, or
+/// whose machine sleeps mid-session never fires SessionEnd, so the entry
+/// lingers in the HUD indefinitely.
+///
+/// Every NATIVE_SWEEP_INTERVAL we walk the registry and drop entries that:
+///   - have no wrapper (wrapper-backed sessions have their own prune loop),
+///   - have no live pending_prompt (the user may still want to respond),
+///   - are in a terminal-ish status (Done / Idle / Exited — never Running
+///     or NeedsApproval),
+///   - have been quiet for longer than the configured cutoff.
+async fn sweep_stale_native_sessions(state: AppState) {
+    let cutoff_hours = std::env::var("SESSIONSD_NATIVE_STALE_HOURS")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .unwrap_or(DEFAULT_NATIVE_STALE_HOURS);
+    let cutoff_secs = (cutoff_hours * 3600.0) as i64;
+    let cutoff = chrono::Duration::seconds(cutoff_secs);
+    tracing::info!(
+        cutoff_hours,
+        interval_secs = NATIVE_SWEEP_INTERVAL.as_secs(),
+        "native stale sweeper armed"
+    );
+
+    loop {
+        tokio::time::sleep(NATIVE_SWEEP_INTERVAL).await;
+
+        let now = Utc::now();
+        let victims: Vec<String> = {
+            let reg = state.registry.read();
+            reg.iter()
+                .filter_map(|(id, s)| {
+                    if s.wrapper_id.is_some() {
+                        return None;
+                    }
+                    if s.pending_prompt.is_some() {
+                        return None;
+                    }
+                    match s.status {
+                        Status::Done | Status::Idle | Status::Exited => {}
+                        _ => return None,
+                    }
+                    if now.signed_duration_since(s.last_event_at) < cutoff {
+                        return None;
+                    }
+                    Some(id.clone())
+                })
+                .collect()
+        };
+
+        if victims.is_empty() {
+            continue;
+        }
+
+        {
+            let mut reg = state.registry.write();
+            for id in &victims {
+                reg.remove(id);
+                tracing::info!(session_id = %id, "native session swept (stale)");
+            }
+        }
+        state.notify_list();
+    }
+}
+
 async fn tail_session(
     registry: Registry,
     tx: broadcast::Sender<SseEvent>,
@@ -1123,6 +1318,7 @@ struct SessionSummary {
     wrapper_id: Option<String>,
     pending_prompt: Option<PendingPrompt>,
     stats: Option<SessionStats>,
+    current_activity: Option<Activity>,
 }
 
 async fn list_sessions(State(state): State<AppState>) -> Json<Vec<SessionSummary>> {
@@ -1140,6 +1336,7 @@ async fn list_sessions(State(state): State<AppState>) -> Json<Vec<SessionSummary
             wrapper_id: s.wrapper_id.clone(),
             pending_prompt: s.pending_prompt.clone(),
             stats: s.stats.clone(),
+            current_activity: s.current_activity.clone(),
         })
         .collect();
     sessions.sort_by(|a, b| b.last_event_at.cmp(&a.last_event_at));
@@ -1213,6 +1410,9 @@ async fn main() -> Result<()> {
 
     // Background task: prune wrappers whose PID has gone away.
     tokio::spawn(prune_dead_wrappers(state.clone()));
+    // Background task: sweep native (hook-only) sessions that missed
+    // SessionEnd — safety net for SIGKILL / force-quit / sleep.
+    tokio::spawn(sweep_stale_native_sessions(state.clone()));
 
     let app = Router::new()
         .route("/health", get(health))

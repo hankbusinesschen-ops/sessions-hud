@@ -51,7 +51,7 @@ PY
     fi
 
     yellow "note: hooks in ~/.claude/settings.json are not auto-removed."
-    yellow "      delete the SessionStart/UserPromptSubmit/Notification/Stop"
+    yellow "      delete the SessionStart/UserPromptSubmit/Notification/Stop/SessionEnd"
     yellow "      entries that reference this repo by hand if you want them gone."
     green "uninstalled."
 }

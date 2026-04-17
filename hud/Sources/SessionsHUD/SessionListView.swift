@@ -46,8 +46,15 @@ struct CompactListView: View {
                     .padding(.vertical, 4)
             }
         }
-        .background(Button("") { showLauncher = true }
-            .keyboardShortcut("n", modifiers: .command)
+        .background(
+            ZStack {
+                Button("") { showLauncher = true }
+                    .keyboardShortcut("n", modifiers: .command)
+                Button("") { model.jumpToAttention(forward: true) }
+                    .keyboardShortcut("j", modifiers: .command)
+                Button("") { model.jumpToAttention(forward: false) }
+                    .keyboardShortcut("j", modifiers: [.command, .shift])
+            }
             .hidden()
         )
     }
@@ -160,30 +167,62 @@ struct CompactListView: View {
             }
             .frame(maxWidth: .infinity)
         } else {
-            ScrollView {
-                LazyVStack(spacing: 0, pinnedViews: [.sectionHeaders]) {
-                    ForEach(groupedSessions, id: \.label) { group in
+            // Tier 0 attention bar stays pinned above the scroll region so
+            // pending-prompt sessions never scroll out of sight. Tier 1 list
+            // (grouped when many sessions, flat when ≤6) lives below.
+            VStack(spacing: 0) {
+                if !model.attentionSessions.isEmpty {
+                    attentionSectionView
+                    Divider().opacity(0.3)
+                }
+                if model.routineSessions.isEmpty {
+                    Spacer(minLength: 0)
+                } else {
+                    routineScrollView
+                }
+            }
+        }
+    }
+
+    /// Tier 0 Attention Bar: cross-group pinned rows for any session with a
+    /// pending prompt or needs_approval status. Header + amber-tinted rows.
+    private var attentionSectionView: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 6) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 9))
+                    .foregroundStyle(Color(red: 0.96, green: 0.62, blue: 0.04))
+                Text("NEEDS ATTENTION")
+                    .font(.system(size: 9 * uiScale, weight: .bold, design: .monospaced))
+                    .foregroundStyle(Color(red: 0.96, green: 0.62, blue: 0.04))
+                Text("(\(model.attentionSessions.count))")
+                    .font(.system(size: 9 * uiScale, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+                Spacer()
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 4)
+            .background(Color.orange.opacity(0.06))
+            ForEach(model.attentionSessions) { session in
+                rowView(session, attentionStyle: true)
+                Divider().opacity(0.15)
+            }
+        }
+    }
+
+    private var routineScrollView: some View {
+        ScrollView {
+            LazyVStack(spacing: 0, pinnedViews: useFlatLayout ? [] : [.sectionHeaders]) {
+                if useFlatLayout {
+                    ForEach(model.routineSessions) { session in
+                        rowView(session)
+                        Divider().opacity(0.15)
+                    }
+                } else {
+                    ForEach(groupedRoutineSessions, id: \.label) { group in
                         Section {
                             ForEach(group.sessions) { session in
-                                SessionRow(
-                                    session: session,
-                                    now: model.now,
-                                    selected: false,
-                                    onClose: { confirmAndClose(session) }
-                                )
-                                .contentShape(Rectangle())
-                                .onTapGesture {
-                                    model.selectedId = session.id
-                                }
-                                .contextMenu {
-                                    Button("Forget session") {
-                                        Task { await model.forgetSession(id: session.id) }
-                                    }
-                                    Button("Terminate (SIGTERM)") {
-                                        confirmAndTerminate(session)
-                                    }
-                                    .disabled(session.wrapperId == nil)
-                                }
+                                rowView(session)
                                 Divider().opacity(0.15)
                             }
                         } header: {
@@ -192,6 +231,30 @@ struct CompactListView: View {
                     }
                 }
             }
+        }
+    }
+
+    /// One row with shared tap + context-menu wiring. Used by both the
+    /// Attention Bar and the routine list so behavior stays identical.
+    @ViewBuilder
+    private func rowView(_ session: SessionSummary, attentionStyle: Bool = false) -> some View {
+        SessionRow(
+            session: session,
+            now: model.now,
+            selected: false,
+            attentionStyle: attentionStyle,
+            onClose: { confirmAndClose(session) }
+        )
+        .contentShape(Rectangle())
+        .onTapGesture { model.selectedId = session.id }
+        .contextMenu {
+            Button("Forget session") {
+                Task { await model.forgetSession(id: session.id) }
+            }
+            Button("Terminate (SIGTERM)") {
+                confirmAndTerminate(session)
+            }
+            .disabled(session.wrapperId == nil)
         }
     }
 
@@ -207,8 +270,15 @@ struct CompactListView: View {
         .background(.ultraThinMaterial)
     }
 
-    private var groupedSessions: [SessionGroup] {
-        SessionGroup.group(model.sessions)
+    /// Auto-flatten when the routine list is small enough that repo group
+    /// headers would be pure overhead. Threshold picked to fit comfortably
+    /// in a small HUD window without scrolling.
+    private var useFlatLayout: Bool {
+        model.routineSessions.count <= 6
+    }
+
+    private var groupedRoutineSessions: [SessionGroup] {
+        SessionGroup.group(model.routineSessions)
     }
 
     /// Row-level close button: picks terminate vs forget based on whether
@@ -273,74 +343,196 @@ struct SessionGroup {
     }
 }
 
+/// Attention-aware status indicator. Replaces the emoji icon in the compact
+/// list. Pulses softly when the session is blocking on user input, fades when
+/// a running session has been quiet for >30s, and stays solid otherwise. The
+/// exact color/animation table lives in `color` + `body` below.
+struct StatusDot: View {
+    let status: SessionSummary.Status
+    let needsAttention: Bool
+    let lastEventAt: Date
+    let now: Date
+    let size: CGFloat
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private static let amber   = Color(red: 0.96, green: 0.62, blue: 0.04)
+    private static let green   = Color(red: 0.08, green: 0.72, blue: 0.46)
+    private static let dimGreen = Color(red: 0.30, green: 0.55, blue: 0.42)
+    private static let bright  = Color(red: 0.16, green: 0.80, blue: 0.40)
+    private static let gray    = Color(red: 0.55, green: 0.58, blue: 0.60)
+    private static let red     = Color(red: 0.86, green: 0.20, blue: 0.18)
+
+    var body: some View {
+        if needsAttention && !reduceMotion {
+            // TimelineView drives a continuous sine pulse from wall-clock time.
+            // All attention dots across the list pulse in phase — cheaper than
+            // per-view animation state and avoids the repeatForever-doesn't-
+            // cancel quirk in SwiftUI.
+            TimelineView(.animation) { context in
+                dot.opacity(pulseOpacity(at: context.date))
+            }
+        } else {
+            dot.opacity(staticOpacity)
+        }
+    }
+
+    private var dot: some View {
+        Circle()
+            .fill(color)
+            .frame(width: size, height: size)
+    }
+
+    private func pulseOpacity(at date: Date) -> Double {
+        let cycle = 1.5
+        let phase = date.timeIntervalSinceReferenceDate
+            .truncatingRemainder(dividingBy: cycle) / cycle
+        let sine = sin(phase * 2 * .pi)            // -1..1
+        return 0.55 + 0.225 * (sine + 1)           // 0.55..1.0
+    }
+
+    private var staticOpacity: Double {
+        isRunningStale ? 0.5 : 1.0
+    }
+
+    private var isRunningStale: Bool {
+        status == .running && now.timeIntervalSince(lastEventAt) > 30
+    }
+
+    private var color: Color {
+        if needsAttention { return Self.amber }
+        switch status {
+        case .running:       return isRunningStale ? Self.dimGreen : Self.green
+        case .idle:          return Self.gray
+        case .done:
+            return now.timeIntervalSince(lastEventAt) < 5 ? Self.bright : Self.gray
+        case .exited:        return Self.red
+        case .needsApproval: return Self.amber
+        case .unknown:       return Self.gray
+        }
+    }
+}
+
 struct SessionRow: View {
     let session: SessionSummary
     let now: Date
     let selected: Bool
+    var attentionStyle: Bool = false
     var onClose: (() -> Void)? = nil
     @AppStorage("uiFontScale") private var uiScale: Double = 1.0
 
+    private static let amber = Color(red: 0.96, green: 0.62, blue: 0.04)
+
     var body: some View {
-        HStack(spacing: 8) {
-            Text(session.status.icon)
-                .font(.system(size: 13 * uiScale))
-            VStack(alignment: .leading, spacing: 1) {
-                Text(session.name)
-                    .font(.system(size: 12 * uiScale, weight: .medium))
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                if let cwd = session.cwd {
-                    Text(shortenedPath(cwd))
-                        .font(.system(size: 9 * uiScale))
-                        .foregroundStyle(.tertiary)
-                        .lineLimit(1)
-                        .truncationMode(.head)
+        HStack(spacing: 0) {
+            // 3pt amber bar on the left marks the attention-bar row. Flush to
+            // the window edge so it reads as a single visual anchor.
+            if attentionStyle {
+                Rectangle()
+                    .fill(Self.amber)
+                    .frame(width: 3)
+            }
+            HStack(alignment: .center, spacing: 8) {
+                StatusDot(
+                    status: session.status,
+                    needsAttention: session.needsAttention,
+                    lastEventAt: session.lastEventAt,
+                    now: now,
+                    size: 8 * uiScale
+                )
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Text(session.name)
+                            .font(.system(size: 12 * uiScale, weight: .medium))
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Spacer(minLength: 4)
+                        Text(rightLabel)
+                            .font(.system(size: 10 * uiScale, design: .monospaced))
+                            .foregroundStyle(rightLabelColor)
+                            .lineLimit(1)
+                    }
+                    HStack(spacing: 6) {
+                        if let cwd = session.cwd {
+                            Text(shortenedPath(cwd))
+                                .font(.system(size: 9 * uiScale))
+                                .foregroundStyle(.tertiary)
+                                .lineLimit(1)
+                                .truncationMode(.head)
+                        }
+                        if let chip = activityChip {
+                            ActivityChipView(icon: chip.icon, label: chip.label, scale: uiScale)
+                                .layoutPriority(1)
+                        }
+                        Spacer(minLength: 4)
+                        if session.wrapperId != nil {
+                            Image(systemName: "link")
+                                .font(.system(size: 9))
+                                .foregroundStyle(.tertiary)
+                                .help("injectable — launched via ccw/cxw")
+                        } else {
+                            Text("RO")
+                                .font(.system(size: 8 * uiScale, weight: .semibold))
+                                .foregroundStyle(.orange)
+                                .padding(.horizontal, 3)
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 3)
+                                        .stroke(Color.orange.opacity(0.6), lineWidth: 1)
+                                )
+                                .help("read-only — native claude, approvals disabled")
+                        }
+                    }
                 }
-                if let stats = session.stats, stats.hasAnyPct || stats.modelDisplay != nil {
-                    StatsLine(stats: stats, fontSize: 9)
+                if let onClose {
+                    Button(action: onClose) {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help(session.wrapperId != nil
+                          ? "Terminate (SIGTERM wrapper)"
+                          : "Forget session (remove from list)")
                 }
             }
-            Spacer(minLength: 4)
-            if session.wrapperId != nil {
-                Image(systemName: "link")
-                    .font(.system(size: 9))
-                    .foregroundStyle(.tertiary)
-                    .help("injectable — launched via ccw/cxw")
-            } else {
-                Text("RO")
-                    .font(.system(size: 8 * uiScale, weight: .semibold))
-                    .foregroundStyle(.orange)
-                    .padding(.horizontal, 3)
-                    .padding(.vertical, 1)
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 3)
-                            .stroke(Color.orange.opacity(0.6), lineWidth: 1)
-                    )
-                    .help("read-only — native claude, approvals disabled")
-            }
-            Text(rightLabel)
-                .font(.system(size: 10 * uiScale, design: .monospaced))
-                .foregroundStyle(.secondary)
-            if let onClose {
-                Button(action: onClose) {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.system(size: 12))
-                        .foregroundStyle(.secondary)
-                }
-                .buttonStyle(.plain)
-                .help(session.wrapperId != nil
-                      ? "Terminate (SIGTERM wrapper)"
-                      : "Forget session (remove from list)")
-            }
+            .padding(.leading, attentionStyle ? 9 : 12)
+            .padding(.trailing, 12)
+            .padding(.vertical, 6)
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 6)
-        .background(selected ? Color.accentColor.opacity(0.18) : Color.clear)
+        .background(rowBackground)
     }
 
+    private var rowBackground: Color {
+        if selected { return Color.accentColor.opacity(0.18) }
+        if attentionStyle { return Color.orange.opacity(0.08) }
+        return Color.clear
+    }
+
+    private var rightLabelColor: Color {
+        if session.needsAttention { return Self.amber }
+        if session.status == .exited { return Color.red.opacity(0.75) }
+        // Threshold-color ctx% when it's the displayed label so runaway
+        // context usage pops on the list without needing the hover popover.
+        if showsCtx, let pct = session.stats?.ctxPct {
+            return StatsLine.color(for: pct)
+        }
+        return .secondary
+    }
+
+    /// True when the right label will render ctx%. Mirrors the logic in
+    /// `rightLabel`; kept in sync so `rightLabelColor` can threshold-color it.
+    private var showsCtx: Bool {
+        guard session.pendingPrompt == nil else { return false }
+        guard session.status == .running || session.status == .idle else { return false }
+        let elapsed = now.timeIntervalSince(session.lastEventAt)
+        if elapsed > 30 { return false }        // stale -> show elapsed instead
+        return session.stats?.ctxPct != nil
+    }
+
+    /// Smart right-side label. Priority: pending prompt summary > status-specific
+    /// label. For running/idle, shows ctx% when fresh + stats available, else
+    /// elapsed time (so a stale session always tells you how long it's been).
     private var rightLabel: String {
-        // If there's a structured prompt, prefer it — tells the user *what*
-        // is blocking rather than just "needs OK".
         if let prompt = session.pendingPrompt {
             switch prompt {
             case .permission(let m):      return promptShort(m)
@@ -350,10 +542,17 @@ struct SessionRow: View {
             }
         }
         switch session.status {
-        case .running, .idle:
-            return "⏱ \(formatElapsed(now.timeIntervalSince(session.lastEventAt)))"
         case .needsApproval:
             return "needs OK"
+        case .running, .idle:
+            let elapsed = now.timeIntervalSince(session.lastEventAt)
+            if elapsed > 30 {
+                return "⏱ \(formatElapsed(elapsed))"
+            }
+            if let pct = session.stats?.ctxPct {
+                return "ctx \(Int(pct.rounded()))%"
+            }
+            return "⏱ \(formatElapsed(elapsed))"
         case .done:
             return "done"
         case .exited:
@@ -387,6 +586,57 @@ struct SessionRow: View {
             return "~" + path.dropFirst(home.count)
         }
         return path
+    }
+
+    /// The activity chip to render on the second row, or nil. Drops to nil
+    /// once `since` is older than 5 minutes — treats the daemon's last known
+    /// activity as stale so a missing PostToolUse doesn't leave a phantom
+    /// chip plastered on a since-idle session. Appended age string (`12s`,
+    /// `2m`) only when > 5s so quick tools don't flicker a timer.
+    fileprivate var activityChip: (icon: String, label: String)? {
+        guard let act = session.currentActivity else { return nil }
+        let elapsed = now.timeIntervalSince(act.since)
+        if elapsed > 300 { return nil }
+        let age = elapsed > 5 ? " \(formatBriefAge(elapsed))" : ""
+        switch act {
+        case .tool(let name, _):
+            return ("gearshape", name + age)
+        case .subagent(let name, _):
+            return ("sparkles", (name ?? "agent") + age)
+        case .compacting:
+            return ("rectangle.compress.vertical", "compacting" + age)
+        }
+    }
+
+    private func formatBriefAge(_ seconds: TimeInterval) -> String {
+        let s = Int(seconds)
+        if s < 60 { return "\(s)s" }
+        return "\(s / 60)m"
+    }
+}
+
+/// Small rounded chip showing "icon label" on the second row of SessionRow.
+/// Deliberately muted — must never outshout the status dot.
+private struct ActivityChipView: View {
+    let icon: String
+    let label: String
+    let scale: Double
+
+    var body: some View {
+        HStack(spacing: 3) {
+            Image(systemName: icon)
+                .font(.system(size: 9 * scale))
+            Text(label)
+                .font(.system(size: 9 * scale, design: .monospaced))
+                .lineLimit(1)
+        }
+        .foregroundStyle(.primary)
+        .padding(.horizontal, 5)
+        .padding(.vertical, 1)
+        .background(
+            RoundedRectangle(cornerRadius: 4)
+                .fill(Color.accentColor.opacity(0.22))
+        )
     }
 }
 
@@ -446,8 +696,19 @@ struct ChatView: View {
             .buttonStyle(.plain)
             .help("Back to list")
 
-            Text(selectedSummary?.status.icon ?? "⚫")
-                .font(.system(size: 14 * uiScale))
+            if let s = selectedSummary {
+                StatusDot(
+                    status: s.status,
+                    needsAttention: s.needsAttention,
+                    lastEventAt: s.lastEventAt,
+                    now: model.now,
+                    size: 10 * uiScale
+                )
+            } else {
+                Circle()
+                    .fill(Color.gray.opacity(0.5))
+                    .frame(width: 10 * uiScale, height: 10 * uiScale)
+            }
 
             VStack(alignment: .leading, spacing: 1) {
                 Text(selectedSummary?.name ?? model.selectedId ?? "")
@@ -1186,6 +1447,8 @@ struct LauncherPopover: View {
 struct SettingsPopover: View {
     @Binding var isPresented: Bool
     @AppStorage("uiFontScale") private var scale: Double = 1.0
+    @AppStorage("showMenuBarBadge") private var showMenuBarBadge: Bool = true
+    @EnvironmentObject var model: AppModel
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -1198,9 +1461,38 @@ struct SettingsPopover: View {
                     .foregroundStyle(.secondary)
             }
             Slider(value: $scale, in: 0.85...1.5, step: 0.05)
-            Text("⌘+ / ⌘- / ⌘0")
+            Text("⌘+ / ⌘- / ⌘0 · ⌘J next waiting")
                 .font(.system(size: 10, design: .monospaced))
                 .foregroundStyle(.tertiary)
+
+            Divider()
+
+            Toggle(isOn: $showMenuBarBadge) {
+                Text("Show attention count in menu bar")
+                    .font(.system(size: 12))
+            }
+            .toggleStyle(.switch)
+            .help("A small • N indicator appears when any session is waiting on you. Click it to raise the HUD.")
+
+            Divider()
+
+            let staleCount = model.staleNativeSessions.count
+            Button {
+                Task { await model.forgetStaleNative() }
+            } label: {
+                HStack {
+                    Image(systemName: "trash")
+                    Text(staleCount > 0
+                         ? "Forget \(staleCount) stale RO session\(staleCount == 1 ? "" : "s")"
+                         : "No stale RO sessions")
+                        .font(.system(size: 12))
+                    Spacer()
+                }
+            }
+            .buttonStyle(.bordered)
+            .disabled(staleCount == 0)
+            .help("Drop native (read-only) sessions idle for >1h from the HUD list. Does not kill processes.")
+
             HStack {
                 Button("Reset") { scale = 1.0 }
                     .buttonStyle(.bordered)
@@ -1211,6 +1503,6 @@ struct SettingsPopover: View {
             }
         }
         .padding(14)
-        .frame(width: 240)
+        .frame(width: 260)
     }
 }

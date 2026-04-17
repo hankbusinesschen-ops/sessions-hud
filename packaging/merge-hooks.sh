@@ -24,7 +24,12 @@ except json.JSONDecodeError as e:
     sys.exit(f"settings.json is not valid JSON ({e}); refusing to merge")
 
 hooks = data.setdefault("hooks", {})
-events = ["SessionStart", "UserPromptSubmit", "Notification", "Stop"]
+events = [
+    "SessionStart", "UserPromptSubmit", "Notification", "Stop", "SessionEnd",
+    "PreToolUse", "PostToolUse",
+    "SubagentStart", "SubagentStop",
+    "PreCompact", "PostCompact",
+]
 script = f"{repo_root}/hooks/post-event.sh"
 
 def already_wired(entry_list):

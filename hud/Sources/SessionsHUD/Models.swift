@@ -11,6 +11,7 @@ struct SessionSummary: Codable, Identifiable, Equatable {
     let wrapperId: String?
     let pendingPrompt: PendingPrompt?
     let stats: SessionStats?
+    let currentActivity: Activity?
 
     enum Status: String, Codable {
         case running
@@ -19,6 +20,61 @@ struct SessionSummary: Codable, Identifiable, Equatable {
         case idle
         case exited
         case unknown
+    }
+}
+
+/// What the session is actively doing right now. Mirrors the daemon's
+/// `Activity` enum (tagged by "kind", snake_case).
+///
+///   {"kind":"tool","name":"Bash","since":"2026-04-17T…"}
+///   {"kind":"subagent","name":"Explore","since":"…"}        (name optional)
+///   {"kind":"compacting","since":"…"}
+enum Activity: Codable, Equatable {
+    case tool(name: String, since: Date)
+    case subagent(name: String?, since: Date)
+    case compacting(since: Date)
+
+    private enum CodingKeys: String, CodingKey {
+        case kind, name, since
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let kind = try c.decode(String.self, forKey: .kind)
+        let since = try c.decode(Date.self, forKey: .since)
+        switch kind {
+        case "tool":
+            self = .tool(name: try c.decode(String.self, forKey: .name), since: since)
+        case "subagent":
+            self = .subagent(name: try c.decodeIfPresent(String.self, forKey: .name), since: since)
+        case "compacting":
+            self = .compacting(since: since)
+        default:
+            self = .tool(name: kind, since: since) // forward-compat: render unknown kind as its tag
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .tool(let n, let s):
+            try c.encode("tool", forKey: .kind)
+            try c.encode(n, forKey: .name)
+            try c.encode(s, forKey: .since)
+        case .subagent(let n, let s):
+            try c.encode("subagent", forKey: .kind)
+            try c.encodeIfPresent(n, forKey: .name)
+            try c.encode(s, forKey: .since)
+        case .compacting(let s):
+            try c.encode("compacting", forKey: .kind)
+            try c.encode(s, forKey: .since)
+        }
+    }
+
+    var since: Date {
+        switch self {
+        case .tool(_, let s), .subagent(_, let s), .compacting(let s): return s
+        }
     }
 }
 
@@ -38,6 +94,7 @@ struct SessionDetail: Codable, Equatable {
     let termProgram: String?
     let pendingPrompt: PendingPrompt?
     let stats: SessionStats?
+    let currentActivity: Activity?
 }
 
 /// Mirrors daemon's `SessionStats`. Populated by the statusline tee pipeline;
@@ -156,6 +213,36 @@ extension SessionSummary.Status {
         case .idle:          return "idle"
         case .exited:        return "exited"
         case .unknown:       return "?"
+        }
+    }
+}
+
+extension SessionSummary {
+    /// True when this session is blocking on something the user has to resolve —
+    /// either an explicit `needs_approval` status or any live pending_prompt
+    /// (permission / plan approval / question / raw). Drives sort priority,
+    /// Attention Bar membership, and the pulsing dot.
+    var needsAttention: Bool {
+        if status == .needsApproval { return true }
+        return pendingPrompt != nil
+    }
+
+    /// Lower = higher priority (sorted to top of the list).
+    ///   0 = needs attention
+    ///   1 = actively running
+    ///   2 = idle / waiting between turns
+    ///   3 = done — recently completed
+    ///   4 = exited — process is dead
+    ///   5 = unknown / fallback
+    var sortPriority: Int {
+        if needsAttention { return 0 }
+        switch status {
+        case .running:       return 1
+        case .idle:          return 2
+        case .done:          return 3
+        case .exited:        return 4
+        case .needsApproval: return 0
+        case .unknown:       return 5
         }
     }
 }

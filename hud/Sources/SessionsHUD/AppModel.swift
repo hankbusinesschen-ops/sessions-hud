@@ -19,7 +19,6 @@ final class AppModel: ObservableObject {
                 selectedDetail = nil
                 injectStatus = nil
             } else if selectedId != oldValue {
-                // Clear any stale detail + error from the previous selection.
                 selectedDetail = nil
                 injectStatus = nil
                 Task { await refreshSelected() }
@@ -32,11 +31,19 @@ final class AppModel: ObservableObject {
 
     private let notifier = Notifier()
     private var clockTimer: Timer?
+    private var healthTimer: Timer?
     private var events: EventStreamClient?
     private let daemonBase: String = {
         ProcessInfo.processInfo.environment["SESSIONSD_URL"] ?? "http://127.0.0.1:39501"
     }()
-    private var url: URL { URL(string: "\(daemonBase)/sessions")! }
+    private func endpoint(_ path: String) -> URL {
+        URL(string: "\(daemonBase)\(path)")!
+    }
+
+    deinit {
+        clockTimer?.invalidate()
+        healthTimer?.invalidate()
+    }
 
     private let decoder: JSONDecoder = {
         let d = JSONDecoder()
@@ -75,15 +82,17 @@ final class AppModel: ObservableObject {
     }
 
     func start() {
-        // Relative-time label tick (independent of session updates so "2m ago"
-        // still counts up when nothing is happening).
         clockTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.now = Date() }
         }
+        // /health poll — SSE can wedge on sleep/wake, so treat HTTP as ground truth.
+        healthTimer = Timer.scheduledTimer(withTimeInterval: 10.0, repeats: true) { [weak self] _ in
+            Task { @MainActor in await self?.checkHealth() }
+        }
         Task { await refresh() }
+        Task { await checkHealth() }
 
-        let eventsURL = URL(string: "\(daemonBase)/events")!
-        let client = EventStreamClient(url: eventsURL)
+        let client = EventStreamClient(url: endpoint("/events"))
         events = client
         Task { [weak self] in
             // Capture once inside the Task so the closures below capture a
@@ -92,9 +101,7 @@ final class AppModel: ObservableObject {
             let owner = self
             await client.start(
                 onConnect: {
-                    await owner?.setConnectionState(.connected)
-                    await owner?.refresh()
-                    await owner?.refreshSelected()
+                    await owner?.onSseConnected()
                 },
                 onDisconnect: {
                     await owner?.setConnectionState(.disconnected)
@@ -106,24 +113,49 @@ final class AppModel: ObservableObject {
         }
     }
 
+    private func onSseConnected() async {
+        setConnectionState(.connected)
+        await withTaskGroup(of: Void.self) { group in
+            group.addTask { [weak self] in await self?.refresh() }
+            group.addTask { [weak self] in await self?.refreshSelected() }
+        }
+    }
+
     private func setConnectionState(_ state: ConnectionState) {
+        guard self.connectionState != state else { return }
         self.connectionState = state
+    }
+
+    private func checkHealth() async {
+        var req = URLRequest(url: endpoint("/health"))
+        req.timeoutInterval = 2
+        let ok: Bool
+        do {
+            let (_, resp) = try await URLSession.shared.data(for: req)
+            let http = resp as? HTTPURLResponse
+            ok = http.map { (200..<300).contains($0.statusCode) } ?? false
+        } catch {
+            ok = false
+        }
+        setConnectionState(ok ? .connected : .disconnected)
     }
 
     private func handleEvent(_ ev: SseEvent) async {
         switch ev {
         case .sessionsChanged:
-            await refresh()
-            if selectedId != nil {
-                await refreshSelected()
+            await withTaskGroup(of: Void.self) { group in
+                group.addTask { [weak self] in await self?.refresh() }
+                if selectedId != nil {
+                    group.addTask { [weak self] in await self?.refreshSelected() }
+                }
             }
         case .sessionUpdated(let id):
-            if id == selectedId {
-                await refreshSelected()
+            await withTaskGroup(of: Void.self) { group in
+                group.addTask { [weak self] in await self?.refresh() }
+                if id == selectedId {
+                    group.addTask { [weak self] in await self?.refreshSelected() }
+                }
             }
-            // Also refresh the list so status / last_event_at / pending_prompt
-            // on the compact row flip in lockstep.
-            await refresh()
         case .unknown:
             break
         }
@@ -131,28 +163,68 @@ final class AppModel: ObservableObject {
 
     func refresh() async {
         do {
-            var req = URLRequest(url: url)
+            var req = URLRequest(url: endpoint("/sessions"))
             req.timeoutInterval = 2
             let (data, _) = try await URLSession.shared.data(for: req)
+            // Daemon sorts by last_event_at desc; we resort on (sortPriority,
+            // lastEventAt desc) so pending prompts float above grouped rows.
             let list = try decoder.decode([SessionSummary].self, from: data)
-            self.sessions = list
+                .sorted { a, b in
+                    if a.sortPriority != b.sortPriority {
+                        return a.sortPriority < b.sortPriority
+                    }
+                    return a.lastEventAt > b.lastEventAt
+                }
+            if self.sessions != list {
+                self.sessions = list
+            }
             self.notifier.observe(list)
             self.lastError = nil
+            setConnectionState(.connected)
         } catch {
             self.lastError = "daemon: \(error.localizedDescription)"
         }
+    }
+
+    /// Sessions the user has to act on — drives the Tier 0 Attention Bar.
+    var attentionSessions: [SessionSummary] {
+        sessions.filter { $0.needsAttention }
+    }
+
+    /// Sessions not in the Attention Bar — drives the grouped / flat list
+    /// below.
+    var routineSessions: [SessionSummary] {
+        sessions.filter { !$0.needsAttention }
+    }
+
+    /// How many sessions are blocking on the user right now. Drives the
+    /// menu-bar badge and the Cmd+J jump shortcut.
+    var attentionCount: Int { attentionSessions.count }
+
+    /// Select the next (or previous) session that `needsAttention`. Wraps at
+    /// the ends. No-op when there's nothing waiting. Called from the
+    /// Cmd+J / Shift+Cmd+J hidden buttons in `SessionListView`.
+    func jumpToAttention(forward: Bool) {
+        let pool = attentionSessions
+        guard !pool.isEmpty else { return }
+        let ids = pool.map(\.id)
+        let currentIdx = selectedId.flatMap { ids.firstIndex(of: $0) }
+        let nextIdx: Int = {
+            guard let i = currentIdx else { return forward ? 0 : ids.count - 1 }
+            return forward
+                ? (i + 1) % ids.count
+                : (i - 1 + ids.count) % ids.count
+        }()
+        selectedId = ids[nextIdx]
     }
 
     /// Fetch the full session payload for the currently selected id so Mode B
     /// can render the message history. Called on selection change and on each
     /// poll tick while a row remains selected.
     func refreshSelected() async {
-        guard let id = selectedId,
-              let url = URL(string: "\(daemonBase)/sessions/\(id)") else {
-            return
-        }
+        guard let id = selectedId else { return }
         do {
-            var req = URLRequest(url: url)
+            var req = URLRequest(url: endpoint("/sessions/\(id)"))
             req.timeoutInterval = 2
             let (data, resp) = try await URLSession.shared.data(for: req)
             if let http = resp as? HTTPURLResponse, http.statusCode == 404 {
@@ -162,7 +234,6 @@ final class AppModel: ObservableObject {
                 return
             }
             let detail = try decoder.decode(SessionDetail.self, from: data)
-            // Avoid publishing an identical value to keep SwiftUI diffs cheap.
             if self.selectedDetail != detail {
                 self.selectedDetail = detail
             }
@@ -177,8 +248,7 @@ final class AppModel: ObservableObject {
     /// writes the bytes into the wrapper's unix socket, which the `cc` PTY
     /// forwards as keystrokes into the underlying child process.
     func injectInput(sessionId: String, text: String) async {
-        guard let url = URL(string: "\(daemonBase)/sessions/\(sessionId)/input") else { return }
-        var req = URLRequest(url: url)
+        var req = URLRequest(url: endpoint("/sessions/\(sessionId)/input"))
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = try? JSONSerialization.data(withJSONObject: ["text": text])
@@ -225,8 +295,7 @@ final class AppModel: ObservableObject {
     /// SIGKILL after 3s. Only valid for wrapper-backed sessions — the HUD
     /// already guards this at the UI level.
     func terminateSession(id: String) async {
-        guard let url = URL(string: "\(daemonBase)/sessions/\(id)/terminate") else { return }
-        var req = URLRequest(url: url)
+        var req = URLRequest(url: endpoint("/sessions/\(id)/terminate"))
         req.httpMethod = "POST"
         do {
             let (_, resp) = try await URLSession.shared.data(for: req)
@@ -269,12 +338,49 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Sessions the user could bulk-forget right now — native (hook-only,
+    /// `wrapperId == nil`) and quiet for > 1h. Drives the badge on the
+    /// "Forget stale RO" settings button.
+    var staleNativeSessions: [SessionSummary] {
+        let cutoff: TimeInterval = 3600
+        let now = Date()
+        return sessions.filter { s in
+            s.wrapperId == nil && now.timeIntervalSince(s.lastEventAt) > cutoff
+        }
+    }
+
+    /// Bulk-DELETE every session in `staleNativeSessions` in parallel, then
+    /// refresh once at the end. Errors per-request are swallowed (any survivor
+    /// will show up on the refreshed list).
+    func forgetStaleNative() async {
+        let targets = staleNativeSessions.map(\.id)
+        guard !targets.isEmpty else {
+            self.injectStatus = "no stale RO sessions to forget"
+            return
+        }
+        await withTaskGroup(of: Void.self) { group in
+            for id in targets {
+                group.addTask { [weak self] in
+                    guard let self else { return }
+                    var req = URLRequest(url: await self.endpoint("/sessions/\(id)"))
+                    req.httpMethod = "DELETE"
+                    req.timeoutInterval = 2
+                    _ = try? await URLSession.shared.data(for: req)
+                }
+            }
+        }
+        if let sid = self.selectedId, targets.contains(sid) {
+            self.selectedId = nil
+        }
+        await refresh()
+        self.injectStatus = "forgot \(targets.count) stale RO session\(targets.count == 1 ? "" : "s")"
+    }
+
     /// Drop the session from the daemon's in-memory registry without killing
     /// anything. Useful for hook-only sessions (native `claude`) the user just
     /// wants off the HUD list.
     func forgetSession(id: String) async {
-        guard let url = URL(string: "\(daemonBase)/sessions/\(id)") else { return }
-        var req = URLRequest(url: url)
+        var req = URLRequest(url: endpoint("/sessions/\(id)"))
         req.httpMethod = "DELETE"
         do {
             let (_, resp) = try await URLSession.shared.data(for: req)
