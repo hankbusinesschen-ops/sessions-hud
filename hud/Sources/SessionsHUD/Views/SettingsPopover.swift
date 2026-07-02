@@ -5,6 +5,7 @@ struct SettingsPopover: View {
     @AppStorage("uiFontScale") private var scale: Double = 1.0
     @AppStorage("showMenuBarBadge") private var showMenuBarBadge: Bool = true
     @EnvironmentObject var model: AppModel
+    @State private var installMessage: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -20,6 +21,26 @@ struct SettingsPopover: View {
             Text("⌘J next waiting · ⇧⌘J previous")
                 .font(.system(size: 10, design: .monospaced))
                 .foregroundStyle(.tertiary)
+
+            Divider()
+
+            Button {
+                installMessage = model.installIntegration() ?? "整合已重新安裝"
+            } label: {
+                HStack {
+                    Image(systemName: "wand.and.stars")
+                    Text("重新安裝 Claude Code 整合")
+                        .font(.system(size: 12))
+                    Spacer()
+                }
+            }
+            .buttonStyle(.bordered)
+            .help("重寫 hooks 與 statusline tee（冪等，可放心重跑）")
+            if let installMessage {
+                Text(installMessage)
+                    .font(.system(size: 9))
+                    .foregroundStyle(.secondary)
+            }
 
             Divider()
 

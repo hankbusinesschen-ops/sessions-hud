@@ -91,6 +91,33 @@ final class AppModel: ObservableObject {
             publish()
             scheduleSnapshot()
         }
+        // While something is red (onboarding visible), keep the checks live
+        // so the panel flips green by itself once the user fixes it. Once
+        // everything is green, stop paying the file-read cost every sweep —
+        // the settings popover refreshes on demand.
+        if runtimeDiagnostics.contains(where: { !$0.ok }) {
+            updateRuntimeDiagnostics()
+        }
+    }
+
+    /// Everything needed to monitor sessions is wired up. Drives the
+    /// onboarding takeover in the content area.
+    var integrationReady: Bool {
+        runtimeDiagnostics.first(where: { $0.id == "hooks" })?.ok ?? true
+    }
+
+    /// One-click Claude Code integration from the onboarding panel — the
+    /// same HooksInstaller the installer CLI uses. Returns an error message
+    /// or nil on success.
+    func installIntegration() -> String? {
+        do {
+            try HooksInstaller.install()
+            updateRuntimeDiagnostics()
+            return nil
+        } catch {
+            updateRuntimeDiagnostics()
+            return error.localizedDescription
+        }
     }
 
     private func publish() {

@@ -95,7 +95,9 @@ struct SessionListView: View {
 
     @ViewBuilder
     private var content: some View {
-        if model.sessions.isEmpty {
+        if !model.integrationReady {
+            OnboardingView()
+        } else if model.sessions.isEmpty {
             VStack(spacing: 8) {
                 Spacer()
                 Image(systemName: "terminal")
