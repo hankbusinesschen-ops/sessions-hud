@@ -1,58 +1,65 @@
 #!/usr/bin/env bash
-# One-shot installer for the sessions HUD stack.
+# One-shot installer for Sessions HUD.
 #
-#   ./install.sh             # build release, copy binaries, install daemon
-#   ./install.sh uninstall   # remove binaries + unload daemon
+#   ./install.sh             # build "Sessions HUD.app", install, wire hooks, open
+#   ./install.sh uninstall   # remove the app + hooks (+ legacy daemon bits)
 #
 # What lands on disk:
-#   ~/.local/bin/ccw           -- claude PTY wrapper
-#   ~/.local/bin/cxw           -- codex PTY wrapper
-#   ~/.local/bin/sessionsd     -- monitoring daemon
-#   ~/.local/bin/sessions-hud  -- SwiftUI HUD (launch manually)
-#   ~/Library/LaunchAgents/com.sessionshud.daemon.plist
+#   /Applications/Sessions HUD.app            (or ~/Applications as fallback)
+#   ~/Library/Application Support/SessionsHUD/post-event.sh
+#   hook entries in ~/.claude/settings.json
+#   quota tee in ~/.claude/statusline-command.sh (only if that file exists)
+#
+# Also migrates away from the pre-2026-07 architecture: unloads the old
+# sessionsd launchd daemon and removes the old ~/.local/bin binaries.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
-BIN_DIR="$HOME/.local/bin"
-LAUNCHD_SCRIPT="$REPO_ROOT/packaging/install-launchd.sh"
-
-RUST_BINS=(ccw cxw sessionsd)
-HUD_SRC="$REPO_ROOT/hud/.build/release/SessionsHUD"
-HUD_DST="$BIN_DIR/sessions-hud"
+APP_NAME="Sessions HUD.app"
+DIST_APP="$REPO_ROOT/dist/$APP_NAME"
 
 red()    { printf '\033[31m%s\033[0m\n' "$*"; }
 green()  { printf '\033[32m%s\033[0m\n' "$*"; }
 yellow() { printf '\033[33m%s\033[0m\n' "$*"; }
 
-uninstall() {
-    echo "→ unloading daemon"
-    "$LAUNCHD_SCRIPT" uninstall || true
-
-    echo "→ removing binaries"
-    for b in "${RUST_BINS[@]}" sessions-hud; do
-        rm -f "$BIN_DIR/$b"
+installed_app() {
+    for dir in "/Applications" "$HOME/Applications"; do
+        if [[ -d "$dir/$APP_NAME" ]]; then
+            echo "$dir/$APP_NAME"
+            return
+        fi
     done
+}
 
-    echo "→ removing statusline patch (if any)"
-    if [[ -f "$HOME/.claude/statusline-command.sh" ]]; then
-        python3 - "$HOME/.claude/statusline-command.sh" <<'PY' || true
-import sys, pathlib, re
-p = pathlib.Path(sys.argv[1])
-text = p.read_text()
-pattern = re.compile(
-    r"# >>> sessions-hud statusline tee >>>.*?# <<< sessions-hud statusline tee <<<\n",
-    re.DOTALL,
-)
-new = pattern.sub("", text)
-if new != text:
-    p.write_text(new)
-    print("statusline: unpatched")
-PY
+# Retire the pre-refactor stack: launchd daemon, PTY wrappers, CLI HUD.
+migrate_legacy() {
+    if launchctl print "gui/$(id -u)/com.sessionshud.daemon" &>/dev/null; then
+        echo "→ unloading legacy sessionsd daemon"
+        launchctl bootout "gui/$(id -u)/com.sessionshud.daemon" || true
     fi
+    rm -f "$HOME/Library/LaunchAgents/com.sessionshud.daemon.plist"
+    rm -f "$HOME/.local/bin/ccw" "$HOME/.local/bin/cxw" \
+          "$HOME/.local/bin/sessionsd" "$HOME/.local/bin/sessions-hud"
+    rm -rf "$HOME/Library/Logs/SessionsHUD"
+}
 
-    yellow "note: hooks in ~/.claude/settings.json are not auto-removed."
-    yellow "      delete the SessionStart/UserPromptSubmit/Notification/Stop/SessionEnd"
-    yellow "      entries that reference this repo by hand if you want them gone."
+uninstall() {
+    local app
+    app="$(installed_app || true)"
+    if [[ -n "${app:-}" ]]; then
+        echo "→ removing hooks + statusline tee"
+        "$app/Contents/MacOS/SessionsHUD" --uninstall-hooks || true
+    fi
+    for dir in "/Applications" "$HOME/Applications"; do
+        if [[ -d "$dir/$APP_NAME" ]]; then
+            echo "→ removing $dir/$APP_NAME"
+            rm -rf "$dir/$APP_NAME"
+        fi
+    done
+    echo "→ cleaning legacy daemon bits"
+    migrate_legacy
+    yellow "note: ~/Library/Application Support/SessionsHUD (事件與狀態) 保留；"
+    yellow "      不需要時可自行刪除。"
     green "uninstalled."
 }
 
@@ -61,56 +68,32 @@ if [[ "${1:-}" == "uninstall" ]]; then
     exit 0
 fi
 
-mkdir -p "$BIN_DIR"
-
-if ! command -v cargo >/dev/null 2>&1; then
-    if [[ -f "$HOME/.cargo/env" ]]; then
-        # shellcheck disable=SC1091
-        source "$HOME/.cargo/env"
-    fi
-fi
-command -v cargo >/dev/null || { red "cargo not found — install rustup first"; exit 1; }
 command -v swift >/dev/null || { red "swift not found — install Xcode command line tools"; exit 1; }
 
-echo "→ building rust workspace (release)"
-(cd "$REPO_ROOT" && cargo build --release --workspace)
+"$REPO_ROOT/scripts/make-app.sh"
 
-echo "→ copying rust binaries to $BIN_DIR"
-cp "$REPO_ROOT/target/release/ccw"       "$BIN_DIR/ccw"
-cp "$REPO_ROOT/target/release/cxw"       "$BIN_DIR/cxw"
-cp "$REPO_ROOT/target/release/sessionsd" "$BIN_DIR/sessionsd"
+# rm before ditto: ditto merges into an existing bundle, which would leave
+# files from older layouts inside the app.
+APP_DST="/Applications/$APP_NAME"
+if rm -rf "$APP_DST" 2>/dev/null && ditto "$DIST_APP" "$APP_DST" 2>/dev/null; then
+    :
+else
+    yellow "⚠ 無法寫入 /Applications，改裝到 ~/Applications"
+    APP_DST="$HOME/Applications/$APP_NAME"
+    mkdir -p "$HOME/Applications"
+    rm -rf "$APP_DST"
+    ditto "$DIST_APP" "$APP_DST"
+fi
+echo "→ installed: $APP_DST"
 
-echo "→ building HUD (release)"
-(cd "$REPO_ROOT/hud" && swift build -c release)
-cp "$HUD_SRC" "$HUD_DST"
-chmod +x "$HUD_DST"
+# Hooks BEFORE legacy teardown: if this step fails, the old setup is still
+# intact instead of leaving a half-migrated machine.
+echo "→ wiring Claude Code hooks + statusline tee"
+"$APP_DST/Contents/MacOS/SessionsHUD" --install-hooks
 
-echo "→ installing launchd daemon"
-"$LAUNCHD_SCRIPT"
-
-echo
-green "installed:"
-printf '  %s\n' \
-    "$BIN_DIR/ccw" \
-    "$BIN_DIR/cxw" \
-    "$BIN_DIR/sessionsd" \
-    "$BIN_DIR/sessions-hud"
-
-case ":$PATH:" in
-    *":$BIN_DIR:"*) ;;
-    *)
-        echo
-        yellow "⚠  $BIN_DIR is not in your \$PATH. Add this to ~/.zshrc:"
-        echo '    export PATH="$HOME/.local/bin:$PATH"'
-        ;;
-esac
+echo "→ cleaning legacy install (daemon / wrappers)"
+migrate_legacy
 
 echo
-echo "→ merging Claude Code hooks into ~/.claude/settings.json"
-"$REPO_ROOT/packaging/merge-hooks.sh" "$REPO_ROOT"
-
-echo "→ patching statusline (if present)"
-"$REPO_ROOT/packaging/patch-statusline.sh"
-
-echo
-green "ready. run 'sessions-hud' to open the HUD, 'ccw <name>' to launch a wrapped claude."
+green "done. 開啟中…（之後可從 Launchpad / Spotlight 搜「Sessions HUD」）"
+open "$APP_DST"

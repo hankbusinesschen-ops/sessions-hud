@@ -1,4 +1,3 @@
-target/
 .DS_Store
 *.swp
 .idea/
@@ -6,3 +5,4 @@ target/
 .build/
 .swiftpm/
 hud/Package.resolved
+dist/
