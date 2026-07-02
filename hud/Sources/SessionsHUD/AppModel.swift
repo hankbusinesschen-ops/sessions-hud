@@ -7,54 +7,30 @@ enum ConnectionState: Equatable {
     case disconnected
 }
 
-/// Fetch state for `GET /sessions/:id` so Chat view can show missing vs still loading.
-enum SelectedSessionDetailState: Equatable {
-    case idle
-    case loading
-    case ready
-    case missing
-    case failed(String)
-}
-
 @MainActor
 final class AppModel: ObservableObject {
     @Published var sessions: [SessionSummary] = []
     @Published var lastError: String?
-    @Published var now: Date = Date()
     @Published var connectionState: ConnectionState = .connecting
-    @Published var selectedId: String? {
-        didSet {
-            if selectedId == nil {
-                selectedDetail = nil
-                injectStatus = nil
-                selectedSessionDetailState = .idle
-            } else if selectedId != oldValue {
-                selectedDetail = nil
-                injectStatus = nil
-                selectedSessionDetailState = .loading
-                Task { await refreshSelected(silent: false) }
-            }
-        }
-    }
-    @Published var selectedSessionDetailState: SelectedSessionDetailState = .idle
-    @Published var selectedDetail: SessionDetail?
-    @Published var injectDraft: String = ""
-    @Published var injectStatus: String?
+    /// Row the user has expanded to see the inline detail preview, or nil.
+    @Published var selectedId: String?
     @Published var runtimeDiagnostics: [RuntimeDiagnostic] = []
 
     private let notifier = Notifier()
-    private var clockTimer: Timer?
     private var healthTimer: Timer?
     private var events: EventStreamClient?
-    private let daemonBase: String = {
-        ProcessInfo.processInfo.environment["SESSIONSD_URL"] ?? "http://127.0.0.1:39501"
+
+    private let daemonBase: URL = {
+        let fallback = URL(string: "http://127.0.0.1:39501")!
+        guard let raw = ProcessInfo.processInfo.environment["SESSIONSD_URL"] else { return fallback }
+        return URL(string: raw) ?? fallback
     }()
+    /// `path` is relative, without a leading slash: "sessions", "health", …
     private func endpoint(_ path: String) -> URL {
-        URL(string: "\(daemonBase)\(path)")!
+        daemonBase.appendingPathComponent(path)
     }
 
     deinit {
-        clockTimer?.invalidate()
         healthTimer?.invalidate()
     }
 
@@ -77,27 +53,7 @@ final class AppModel: ObservableObject {
         return d
     }()
 
-    /// Distinct git-repo roots currently in use by any live session, ordered
-    /// by most-recently-active first. Used as quick-pick in the launcher
-    /// popover. Sessions whose cwd isn't inside a git repo are skipped —
-    /// the launcher falls back to NSOpenPanel for those.
-    var recentProjectRoots: [String] {
-        let sorted = sessions.sorted { $0.lastEventAt > $1.lastEventAt }
-        var seen: Set<String> = []
-        var out: [String] = []
-        for s in sorted {
-            guard let root = RepoRoot.absolutePath(for: s.cwd) else { continue }
-            if seen.insert(root).inserted {
-                out.append(root)
-            }
-        }
-        return out
-    }
-
     func start() {
-        clockTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.now = Date() }
-        }
         // /health poll — SSE can wedge on sleep/wake, so treat HTTP as ground truth.
         healthTimer = Timer.scheduledTimer(withTimeInterval: 10.0, repeats: true) { [weak self] _ in
             Task { @MainActor in await self?.checkHealth() }
@@ -106,7 +62,7 @@ final class AppModel: ObservableObject {
         Task { await checkHealth() }
         updateRuntimeDiagnostics()
 
-        let client = EventStreamClient(url: endpoint("/events"))
+        let client = EventStreamClient(url: endpoint("events"))
         events = client
         Task { [weak self] in
             // Capture once inside the Task so the closures below capture a
@@ -120,8 +76,8 @@ final class AppModel: ObservableObject {
                 onDisconnect: {
                     await owner?.setConnectionState(.disconnected)
                 },
-                onEvent: { ev in
-                    await owner?.handleEvent(ev)
+                onEvent: { _ in
+                    await owner?.refresh()
                 }
             )
         }
@@ -129,10 +85,7 @@ final class AppModel: ObservableObject {
 
     private func onSseConnected() async {
         setConnectionState(.connected)
-        await withTaskGroup(of: Void.self) { group in
-            group.addTask { [weak self] in await self?.refresh() }
-            group.addTask { [weak self] in await self?.refreshSelected(silent: true) }
-        }
+        await refresh()
     }
 
     private func setConnectionState(_ state: ConnectionState) {
@@ -142,7 +95,7 @@ final class AppModel: ObservableObject {
     }
 
     private func checkHealth() async {
-        var req = URLRequest(url: endpoint("/health"))
+        var req = URLRequest(url: endpoint("health"))
         req.timeoutInterval = 2
         let ok: Bool
         do {
@@ -155,34 +108,13 @@ final class AppModel: ObservableObject {
         setConnectionState(ok ? .connected : .disconnected)
     }
 
-    private func handleEvent(_ ev: SseEvent) async {
-        switch ev {
-        case .sessionsChanged:
-            await withTaskGroup(of: Void.self) { group in
-                group.addTask { [weak self] in await self?.refresh() }
-                if selectedId != nil {
-                    group.addTask { [weak self] in await self?.refreshSelected(silent: true) }
-                }
-            }
-        case .sessionUpdated(let id):
-            await withTaskGroup(of: Void.self) { group in
-                group.addTask { [weak self] in await self?.refresh() }
-                if id == selectedId {
-                    group.addTask { [weak self] in await self?.refreshSelected(silent: true) }
-                }
-            }
-        case .unknown:
-            break
-        }
-    }
-
     func refresh() async {
         do {
-            var req = URLRequest(url: endpoint("/sessions"))
+            var req = URLRequest(url: endpoint("sessions"))
             req.timeoutInterval = 2
             let (data, _) = try await URLSession.shared.data(for: req)
-            // Daemon sorts by last_event_at desc; we resort on (sortPriority,
-            // lastEventAt desc) so pending prompts float above grouped rows.
+            // Sort on (sortPriority, lastEventAt desc) so pending prompts
+            // float above everything else.
             let list = try decoder.decode([SessionSummary].self, from: data)
                 .sorted { a, b in
                     if a.sortPriority != b.sortPriority {
@@ -194,8 +126,7 @@ final class AppModel: ObservableObject {
                 self.sessions = list
             }
             if let sid = self.selectedId, !list.contains(where: { $0.id == sid }) {
-                self.selectedDetail = nil
-                self.selectedSessionDetailState = .missing
+                self.selectedId = nil
             }
             self.notifier.observe(list)
             self.lastError = nil
@@ -210,8 +141,7 @@ final class AppModel: ObservableObject {
         sessions.filter { $0.needsAttention }
     }
 
-    /// Sessions not in the Attention Bar — drives the grouped / flat list
-    /// below.
+    /// Sessions not in the Attention Bar — drives the grouped / flat list below.
     var routineSessions: [SessionSummary] {
         sessions.filter { !$0.needsAttention }
     }
@@ -220,7 +150,7 @@ final class AppModel: ObservableObject {
     /// menu-bar badge and the Cmd+J jump shortcut.
     var attentionCount: Int { attentionSessions.count }
 
-    /// Select the next (or previous) session that `needsAttention`. Wraps at
+    /// Expand the next (or previous) session that `needsAttention`. Wraps at
     /// the ends. No-op when there's nothing waiting. Called from the
     /// Cmd+J / Shift+Cmd+J hidden buttons in `SessionListView`.
     func jumpToAttention(forward: Bool) {
@@ -237,38 +167,7 @@ final class AppModel: ObservableObject {
         selectedId = ids[nextIdx]
     }
 
-    /// Fetch the full session payload for the currently selected id so Mode B
-    /// can render the message history. Called on selection change and on each
-    /// poll tick while a row remains selected.
-    func refreshSelected(silent: Bool = false) async {
-        guard let id = selectedId else { return }
-        if !silent {
-            selectedSessionDetailState = .loading
-        }
-        do {
-            var req = URLRequest(url: endpoint("/sessions/\(id)"))
-            req.timeoutInterval = 2
-            let (data, resp) = try await URLSession.shared.data(for: req)
-            guard selectedId == id else { return }
-            if let http = resp as? HTTPURLResponse, http.statusCode == 404 {
-                self.selectedDetail = nil
-                self.selectedSessionDetailState = .missing
-                return
-            }
-            let detail = try decoder.decode(SessionDetail.self, from: data)
-            guard selectedId == id else { return }
-            self.selectedDetail = detail
-            self.selectedSessionDetailState = .ready
-            self.injectStatus = nil
-        } catch {
-            guard selectedId == id else { return }
-            self.selectedDetail = nil
-            self.selectedSessionDetailState = .failed(error.localizedDescription)
-            self.injectStatus = "detail: \(error.localizedDescription)"
-        }
-    }
-
-    /// Recompute local + daemon diagnostic rows (hooks, statusline, PATH, 39501).
+    /// Recompute local + daemon diagnostic rows (hooks, statusline).
     func updateRuntimeDiagnostics() {
         var items: [RuntimeDiagnostic] = []
         let (daemonOk, daemonDetail): (Bool, String) = {
@@ -295,135 +194,32 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// Send Ctrl+C (ETX) to the wrapper PTY (interrupt running tool / TUI).
-    func sendInterrupt(sessionId: String) async {
-        await injectInput(sessionId: sessionId, text: "\u{3}")
-    }
-
-    /// Send a bare Enter (e.g. confirm empty prompt, continue in some TUI states).
-    func sendEnter(sessionId: String) async {
-        await injectInput(sessionId: sessionId, text: "\r")
-    }
-
-    /// POST the given text to `/sessions/<id>/input`. On success, the daemon
-    /// writes the bytes into the wrapper's unix socket, which the `cc` PTY
-    /// forwards as keystrokes into the underlying child process.
-    func injectInput(sessionId: String, text: String) async {
-        var req = URLRequest(url: endpoint("/sessions/\(sessionId)/input"))
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.httpBody = try? JSONSerialization.data(withJSONObject: ["text": text])
-        do {
-            let (_, resp) = try await URLSession.shared.data(for: req)
-            if let http = resp as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
-                self.injectStatus = "inject failed: HTTP \(http.statusCode)"
-            } else {
-                self.injectStatus = nil
-            }
-        } catch {
-            self.injectStatus = "inject error: \(error.localizedDescription)"
-        }
-    }
-
-    /// Respond to a fixed 3-choice prompt (Permission / PlanApproval) by
-    /// injecting the numeric shortcut + CR. `choice` is 1-based: 1=Yes,
-    /// 2=Yes-always (or 2nd plan mode), 3=No (or 3rd plan mode).
-    func respondToPrompt(id: String, choice: Int) async {
-        guard (1...9).contains(choice) else { return }
-        await injectInput(sessionId: id, text: "\(choice)\r")
-    }
-
-    /// Answer an AskUserQuestion by sending the selected option labels as
-    /// free text. For single-select: one label. For multi-select: labels
-    /// joined by ", ". Falls back via `submitFreeText` if the user typed
-    /// something custom.
-    func answerQuestion(id: String, selections: [String]) async {
-        guard !selections.isEmpty else { return }
-        let joined = selections.joined(separator: ", ")
-        await injectInput(sessionId: id, text: "\(joined)\r")
-    }
-
-    /// Send arbitrary free-text as the answer to whatever prompt is live.
-    /// Used both by the AskUserQuestion "Other" field and by generic
-    /// elicitation dialogs where we only have a raw message.
-    func submitFreeText(id: String, text: String) async {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        await injectInput(sessionId: id, text: "\(trimmed)\r")
-    }
-
-    /// SIGTERM the wrapper process backing `sessionId`. Daemon escalates to
-    /// SIGKILL after 3s. Only valid for wrapper-backed sessions — the HUD
-    /// already guards this at the UI level.
-    func terminateSession(id: String) async {
-        var req = URLRequest(url: endpoint("/sessions/\(id)/terminate"))
-        req.httpMethod = "POST"
-        do {
-            let (_, resp) = try await URLSession.shared.data(for: req)
-            if let http = resp as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
-                self.lastError = "terminate failed: HTTP \(http.statusCode)"
-                return
-            }
-            if self.selectedId == id {
-                self.selectedId = nil
-            }
-            await refresh()
-        } catch {
-            self.lastError = "terminate error: \(error.localizedDescription)"
-        }
-    }
-
-    /// Relaunch the currently selected native (non-wrapper) session as a
-    /// ccw-wrapped one by asking Terminal.app / iTerm to open a new window
-    /// running `ccw <name>` in the same cwd. The original native process
-    /// keeps running — the user can close it from its own terminal — but
-    /// a fresh wrapper-backed session will replace it in the HUD list as
-    /// soon as its SessionStart hook fires.
-    func relaunchSelectedAsCcw() {
-        guard let sid = selectedId,
-              let s = sessions.first(where: { $0.id == sid }) else { return }
-        guard s.wrapperId == nil else { return }
-        guard let cwd = s.cwd, !cwd.isEmpty else {
-            self.injectStatus = "relaunch: unknown cwd"
-            return
-        }
-        if let err = TerminalFocus.launchNewSession(
-            flavor: .ccw,
-            mode: .defaultMode,
-            name: s.name,
-            cwd: cwd
-        ) {
-            self.injectStatus = "relaunch failed: \(err)"
-        } else {
-            self.injectStatus = "relaunching as ccw…"
-        }
-    }
-
-    /// Sessions the user could bulk-forget right now — native (hook-only,
-    /// `wrapperId == nil`) and quiet for > 1h. Drives the badge on the
-    /// "Forget stale RO" settings button.
-    var staleNativeSessions: [SessionSummary] {
+    /// Sessions quiet for > 1h — candidates for the bulk-forget button in
+    /// settings. Never includes sessions that are running or waiting on the
+    /// user: a 70-minute-old permission prompt is exactly what the HUD exists
+    /// to surface, not something to sweep away. (Automatic sweeping arrives
+    /// with the local store.)
+    var staleSessions: [SessionSummary] {
         let cutoff: TimeInterval = 3600
         let now = Date()
         return sessions.filter { s in
-            s.wrapperId == nil && now.timeIntervalSince(s.lastEventAt) > cutoff
+            !s.needsAttention
+                && s.status != .running
+                && now.timeIntervalSince(s.lastEventAt) > cutoff
         }
     }
 
-    /// Bulk-DELETE every session in `staleNativeSessions` in parallel, then
-    /// refresh once at the end. Errors per-request are swallowed (any survivor
-    /// will show up on the refreshed list).
-    func forgetStaleNative() async {
-        let targets = staleNativeSessions.map(\.id)
-        guard !targets.isEmpty else {
-            self.injectStatus = "no stale RO sessions to forget"
-            return
-        }
+    /// Bulk-DELETE every session in `staleSessions` in parallel, then refresh
+    /// once at the end. Errors per-request are swallowed (any survivor will
+    /// show up on the refreshed list).
+    func forgetStale() async {
+        let targets = staleSessions.map(\.id)
+        guard !targets.isEmpty else { return }
         await withTaskGroup(of: Void.self) { group in
             for id in targets {
                 group.addTask { [weak self] in
                     guard let self else { return }
-                    var req = URLRequest(url: await self.endpoint("/sessions/\(id)"))
+                    var req = URLRequest(url: await self.endpoint("sessions/\(id)"))
                     req.httpMethod = "DELETE"
                     req.timeoutInterval = 2
                     _ = try? await URLSession.shared.data(for: req)
@@ -434,14 +230,12 @@ final class AppModel: ObservableObject {
             self.selectedId = nil
         }
         await refresh()
-        self.injectStatus = "forgot \(targets.count) stale RO session\(targets.count == 1 ? "" : "s")"
     }
 
-    /// Drop the session from the daemon's in-memory registry without killing
-    /// anything. Useful for hook-only sessions (native `claude`) the user just
-    /// wants off the HUD list.
+    /// Drop the session from the list without killing anything. The
+    /// underlying claude process keeps running.
     func forgetSession(id: String) async {
-        var req = URLRequest(url: endpoint("/sessions/\(id)"))
+        var req = URLRequest(url: endpoint("sessions/\(id)"))
         req.httpMethod = "DELETE"
         do {
             let (_, resp) = try await URLSession.shared.data(for: req)

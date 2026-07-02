@@ -40,14 +40,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         installMenu()
         installStatusItem()
 
-        // First-run: trigger the Automation consent dialog up-front so the
-        // user doesn't hit a silent failure the first time they click
-        // `+` → Launch. Remembered in UserDefaults so we only prompt once.
-        if !UserDefaults.standard.bool(forKey: "sessions-hud.automationPrimed") {
-            TerminalFocus.primeAutomationPermission()
-            UserDefaults.standard.set(true, forKey: "sessions-hud.automationPrimed")
-        }
-
         model.start()
     }
 
