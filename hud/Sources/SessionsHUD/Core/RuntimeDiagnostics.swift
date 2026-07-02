@@ -21,16 +21,27 @@ enum RuntimeDiagnostics {
     static func gatherFileBasedChecks() -> [RuntimeDiagnostic] {
         var out: [RuntimeDiagnostic] = []
         if FileManager.default.fileExists(atPath: settingsURL.path) {
-            if let s = try? String(contentsOf: settingsURL, encoding: .utf8) {
-                let hasHook = s.contains("post-event.sh")
+            // Parse instead of raw-text matching: JSONSerialization may have
+            // written escaped slashes, and only parsed commands are reliable.
+            if let data = try? Data(contentsOf: settingsURL),
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                let hooks = json["hooks"] as? [String: Any] ?? [:]
+                let hasHook = hooks.values.contains { value in
+                    guard let blocks = value as? [[String: Any]] else { return false }
+                    return blocks.contains { block in
+                        ((block["hooks"] as? [[String: Any]]) ?? []).contains { h in
+                            HooksInstaller.isOurCommand((h["command"] as? String) ?? "")
+                        }
+                    }
+                }
                 out.append(
                     RuntimeDiagnostic(
                         id: "hooks",
                         ok: hasHook,
                         label: "Claude hooks",
                         detail: hasHook
-                            ? "settings.json references post-event.sh"
-                            : "merge packaging/merge-hooks.sh or re-run install.sh"
+                            ? "settings.json 已接上 post-event.sh"
+                            : "未安裝 — 執行 ./install.sh"
                     )
                 )
             } else {

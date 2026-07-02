@@ -6,3 +6,4 @@ target/
 .build/
 .swiftpm/
 hud/Package.resolved
+dist/
