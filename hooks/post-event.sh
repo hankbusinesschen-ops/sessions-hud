@@ -1,40 +1,47 @@
-#!/usr/bin/env bash
-# Bridge a Claude Code hook into the sessionsd daemon.
+#!/bin/zsh
+# Bridge a Claude Code hook into the Sessions HUD event spool.
 # Usage: post-event.sh <EventName>
-# Reads the hook payload from stdin and POSTs it to the daemon.
-# Fails silently — never block Claude Code on a daemon outage.
-set -uo pipefail
+# Reads the hook payload from stdin, wraps it with local context (claude pid,
+# tty, terminal app), and atomically drops one JSON file into the spool
+# directory watched by Sessions HUD.app. Fails silently and never blocks
+# Claude Code.
+{
+    zmodload zsh/datetime || exit 0
+    EVENT="${${1:-unknown}//[\"\\\\]/}"
+    SPOOL="${SESSIONSHUD_SPOOL:-$HOME/Library/Application Support/SessionsHUD/events}"
+    mkdir -p "$SPOOL" || exit 0
 
-EVENT="${1:-unknown}"
-DAEMON_URL="${SESSIONSD_URL:-http://127.0.0.1:39501}"
+    PAYLOAD="$(cat)"
+    [[ -z "$PAYLOAD" ]] && PAYLOAD="{}"
 
-# Drain stdin into a variable so we can pass it to curl with a short timeout.
-PAYLOAD="$(cat)"
+    # Microsecond timestamp, zero-padded to 16 digits so lexicographic
+    # filename order equals chronological order.
+    TS_SEC="${EPOCHREALTIME%.*}"
+    TS_FRAC="${EPOCHREALTIME#*.}000000"
+    TS="$(printf '%016d' $(( TS_SEC * 1000000 + ${TS_FRAC[1,6]} )))"
 
-# Optional debug: set SESSIONSD_DEBUG_LOG to a file path to append Notification payloads.
-if [ "$EVENT" = "Notification" ] && [ -n "${SESSIONSD_DEBUG_LOG:-}" ]; then
-    {
-        echo "--- $(date -Iseconds) ---"
-        echo "$PAYLOAD"
-        echo
-    } >> "${SESSIONSD_DEBUG_LOG}" 2>/dev/null || true
-fi
+    # Nearest claude-ish ancestor: Claude Code may exec hooks via `sh -c`,
+    # so walk up a few levels before settling for the direct parent.
+    PID=$PPID
+    for _ in 1 2 3; do
+        COMM="$(ps -o comm= -p $PID 2>/dev/null)"
+        case "${COMM:t}" in
+            (*claude*|*node*|*bun*) break ;;
+        esac
+        NEXT="$(ps -o ppid= -p $PID 2>/dev/null | tr -d ' ')"
+        [[ -z "$NEXT" || "$NEXT" == "$PID" || "$NEXT" -le 1 ]] && break
+        PID=$NEXT
+    done
 
-# If we were spawned under a `cc` PTY wrapper, propagate its id so the
-# daemon can map session_id ↔ wrapper and use the user's chosen name.
-WRAPPER_HEADER=()
-if [ -n "${CC_WRAPPER_ID:-}" ]; then
-    WRAPPER_HEADER=(-H "X-Cc-Wrapper-Id: ${CC_WRAPPER_ID}")
-fi
+    # Controlling tty is inherited from claude even though hook stdio is piped.
+    TTY_NAME="$(ps -o tty= -p $$ 2>/dev/null | tr -d ' ')"
+    if [[ -z "$TTY_NAME" || "$TTY_NAME" == "??" ]]; then TTY=""; else TTY="/dev/$TTY_NAME"; fi
 
-curl --silent --show-error --fail \
-    --max-time 1 \
-    --connect-timeout 1 \
-    -H 'Content-Type: application/json' \
-    ${WRAPPER_HEADER[@]+"${WRAPPER_HEADER[@]}"} \
-    -X POST \
-    --data "$PAYLOAD" \
-    "${DAEMON_URL}/hook/${EVENT}" \
-    >/dev/null 2>&1 || true
+    TERM_PROG="${TERM_PROGRAM//[\"\\\\]/}"
 
+    TMP="$SPOOL/.tmp.$$"
+    printf '{"v":1,"event":"%s","ts":%s,"pid":%d,"tty":"%s","term_program":"%s","payload":%s}\n' \
+        "$EVENT" "$TS" "$PID" "$TTY" "$TERM_PROG" "$PAYLOAD" > "$TMP" \
+        && mv -f "$TMP" "$SPOOL/$TS-$$.json"
+} >/dev/null 2>&1
 exit 0
