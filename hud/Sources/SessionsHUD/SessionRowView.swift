@@ -233,11 +233,12 @@ struct SessionRow: View {
     }
 }
 
-/// Inline expansion under a tapped row: full status, cwd, pending prompt
-/// text, and quota.
+/// Inline expansion under a tapped row: full status, quota, cwd, pending
+/// prompt text, and the jump-to-terminal action.
 struct SessionInlineDetail: View {
     let session: SessionSummary
     @AppStorage("uiFontScale") private var uiScale: Double = 1.0
+    @State private var jumpError: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -247,8 +248,14 @@ struct SessionInlineDetail: View {
                     .foregroundStyle(.secondary)
                 if let stats = session.stats, stats.hasAnyPct || stats.modelDisplay != nil {
                     StatsLine(stats: stats, fontSize: 10)
+                } else {
+                    Text("quota —")
+                        .font(.system(size: 10 * uiScale, design: .monospaced))
+                        .foregroundStyle(.quaternary)
+                        .help("需要安裝 statusline tee 才會顯示 ctx% / 5h% / 7d%")
                 }
                 Spacer()
+                jumpButton
             }
             if let cwd = session.cwd {
                 Text(cwd)
@@ -269,11 +276,41 @@ struct SessionInlineDetail: View {
                     .background(Color.yellow.opacity(0.12))
                     .clipShape(RoundedRectangle(cornerRadius: 6))
             }
+            if let jumpError {
+                Text(jumpError)
+                    .font(.system(size: 9 * uiScale))
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color.primary.opacity(0.03))
+    }
+
+    private var canJump: Bool { !session.tty.isEmpty }
+
+    private var jumpButton: some View {
+        Button {
+            jumpError = TerminalFocus.openInTerminal(
+                tty: session.tty,
+                termProgram: session.termProgram.isEmpty ? nil : session.termProgram
+            )
+        } label: {
+            HStack(spacing: 3) {
+                Image(systemName: "arrow.up.right.square")
+                    .font(.system(size: 11))
+                Text("終端機")
+                    .font(.system(size: 10 * uiScale))
+            }
+        }
+        .buttonStyle(.bordered)
+        .controlSize(.small)
+        .disabled(!canJump)
+        .help(canJump
+            ? "跳到這個 session 所在的終端機分頁"
+            : "沒有 tty 資訊（tmux / SSH / IDE 內建終端不支援跳轉）")
     }
 }
 
