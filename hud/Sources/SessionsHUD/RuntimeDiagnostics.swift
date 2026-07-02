@@ -1,6 +1,6 @@
 import Foundation
 
-/// Local checks the HUD can run to guide users (daemon, hooks, statusline, ccw in PATH).
+/// Local checks the HUD can run to guide users (hooks, statusline tee).
 struct RuntimeDiagnostic: Identifiable, Equatable {
     let id: String
     let ok: Bool
@@ -17,7 +17,7 @@ enum RuntimeDiagnostics {
     private static var settingsURL: URL { homeClaude.appendingPathComponent("settings.json") }
     private static var statuslineURL: URL { homeClaude.appendingPathComponent("statusline-command.sh") }
 
-    /// Gathers file-based checks. Caller should merge in daemon state from `AppModel`.
+    /// Gathers file-based checks. AppModel prepends the spool-health row.
     static func gatherFileBasedChecks() -> [RuntimeDiagnostic] {
         var out: [RuntimeDiagnostic] = []
         if FileManager.default.fileExists(atPath: settingsURL.path) {
@@ -56,17 +56,34 @@ enum RuntimeDiagnostics {
 
         if FileManager.default.fileExists(atPath: statuslineURL.path) {
             if let s = try? String(contentsOf: statuslineURL, encoding: .utf8) {
-                let ok = s.contains("39501/hook/statusline")
-                out.append(
-                    RuntimeDiagnostic(
-                        id: "statusline",
-                        ok: ok,
-                        label: "Statusline tee",
-                        detail: ok
-                            ? "statusline-command.sh posts to sessionsd"
-                            : "add tee from packaging/patch-statusline.sh for ctx% / 5h% / 7d%"
+                if s.contains("SessionsHUD/events") {
+                    out.append(
+                        RuntimeDiagnostic(
+                            id: "statusline",
+                            ok: true,
+                            label: "Statusline tee",
+                            detail: "quota tee 已寫入事件資料夾"
+                        )
                     )
-                )
+                } else if s.contains("39501/hook/statusline") {
+                    out.append(
+                        RuntimeDiagnostic(
+                            id: "statusline",
+                            ok: false,
+                            label: "Statusline tee",
+                            detail: "偵測到舊版 daemon tee — 重新執行 install.sh 更新"
+                        )
+                    )
+                } else {
+                    out.append(
+                        RuntimeDiagnostic(
+                            id: "statusline",
+                            ok: false,
+                            label: "Statusline tee",
+                            detail: "未安裝 quota tee（ctx% / 5h% / 7d% 需要它）— 執行 install.sh"
+                        )
+                    )
+                }
             } else {
                 out.append(
                     RuntimeDiagnostic(
@@ -84,7 +101,7 @@ enum RuntimeDiagnostics {
                     id: "statusline",
                     ok: true,
                     label: "Statusline tee",
-                    detail: "未安裝（選用；HUD 的 ctx% / 5h% / 7d% 需 packaging/patch-statusline.sh）"
+                    detail: "未安裝（選用；HUD 的 ctx% / 5h% / 7d% 需要自訂 statusline）"
                 )
             )
         }

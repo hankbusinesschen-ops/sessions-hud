@@ -14,11 +14,13 @@
     PAYLOAD="$(cat)"
     [[ -z "$PAYLOAD" ]] && PAYLOAD="{}"
 
-    # Microsecond timestamp, zero-padded to 16 digits so lexicographic
-    # filename order equals chronological order.
+    # Microsecond timestamp. The filename copy is zero-padded to 16 digits so
+    # lexicographic order equals chronological order; the JSON copy stays an
+    # unpadded integer (leading zeros are invalid JSON).
     TS_SEC="${EPOCHREALTIME%.*}"
     TS_FRAC="${EPOCHREALTIME#*.}000000"
-    TS="$(printf '%016d' $(( TS_SEC * 1000000 + ${TS_FRAC[1,6]} )))"
+    TS_NUM=$(( TS_SEC * 1000000 + ${TS_FRAC[1,6]} ))
+    TS="$(printf '%016d' $TS_NUM)"
 
     # Nearest claude-ish ancestor: Claude Code may exec hooks via `sh -c`,
     # so walk up a few levels before settling for the direct parent.
@@ -41,7 +43,7 @@
 
     TMP="$SPOOL/.tmp.$$"
     printf '{"v":1,"event":"%s","ts":%s,"pid":%d,"tty":"%s","term_program":"%s","payload":%s}\n' \
-        "$EVENT" "$TS" "$PID" "$TTY" "$TERM_PROG" "$PAYLOAD" > "$TMP" \
+        "$EVENT" "$TS_NUM" "$PID" "$TTY" "$TERM_PROG" "$PAYLOAD" > "$TMP" \
         && mv -f "$TMP" "$SPOOL/$TS-$$.json"
 } >/dev/null 2>&1
 exit 0

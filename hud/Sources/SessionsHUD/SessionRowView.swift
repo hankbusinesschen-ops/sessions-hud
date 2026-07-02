@@ -66,7 +66,6 @@ struct StatusDot: View {
         case .idle:          return Self.gray
         case .done:
             return now.timeIntervalSince(lastEventAt) < 5 ? Self.bright : Self.gray
-        case .exited:        return Self.red
         case .needsApproval: return .attentionAmber
         case .unknown:       return Self.gray
         }
@@ -170,7 +169,6 @@ struct SessionRow: View {
             switch prompt {
             case .permission(let m):      return (promptShort(m), .attentionAmber)
             case .planApproval:           return ("plan approval", .attentionAmber)
-            case .question:               return ("question", .attentionAmber)
             case .raw:                    return ("prompt", .attentionAmber)
             }
         }
@@ -185,8 +183,6 @@ struct SessionRow: View {
             return ("⏱ \(formatElapsed(elapsed))", .secondary)
         case .done:
             return ("done", .secondary)
-        case .exited:
-            return ("exited", Color.red.opacity(0.75))
         case .unknown:
             return ("", .secondary)
         }

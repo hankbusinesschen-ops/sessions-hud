@@ -13,20 +13,11 @@ struct SessionListView: View {
         VStack(alignment: .leading, spacing: 0) {
             header
             Divider().opacity(0.3)
-            if model.connectionState == .disconnected {
-                disconnectedBanner
+            if !model.spoolActive {
+                spoolFailureBanner
                 Divider().opacity(0.3)
             }
             content
-            if let err = model.lastError {
-                Divider().opacity(0.3)
-                Text(err)
-                    .font(.system(size: 10 * uiScale))
-                    .foregroundStyle(.red)
-                    .lineLimit(1)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 4)
-            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(.ultraThinMaterial)
@@ -42,13 +33,13 @@ struct SessionListView: View {
         .onExitCommand { model.selectedId = nil }
     }
 
-    private var disconnectedBanner: some View {
+    private var spoolFailureBanner: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 4) {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .font(.system(size: 10))
                     .foregroundStyle(.orange)
-                Text("sessionsd 未連線")
+                Text("無法監看事件資料夾")
                     .font(.system(size: 10 * uiScale))
                     .foregroundStyle(.secondary)
             }
@@ -63,22 +54,12 @@ struct SessionListView: View {
         .background(Color.orange.opacity(0.08))
     }
 
-    private var connectionDotColor: Color {
-        switch model.connectionState {
-        case .connected:    return .green
-        case .connecting:   return .orange
-        case .disconnected: return .red
-        }
-    }
-
     private var header: some View {
         HStack(spacing: 6) {
             Circle()
-                .fill(connectionDotColor)
+                .fill(model.spoolActive ? Color.green : Color.red)
                 .frame(width: 7, height: 7)
-                .help(model.connectionState == .connected ? "已連線"
-                    : model.connectionState == .connecting ? "正在連線…"
-                    : "未連線")
+                .help(model.spoolActive ? "監看事件中" : "事件資料夾異常")
             Text("Sessions")
                 .font(.system(size: 12 * uiScale, weight: .semibold))
                 .foregroundStyle(.secondary)
@@ -118,24 +99,15 @@ struct SessionListView: View {
         if model.sessions.isEmpty {
             VStack(spacing: 8) {
                 Spacer()
-                if model.connectionState == .disconnected {
-                    Image(systemName: "bolt.horizontal.circle")
-                        .font(.system(size: 24))
-                        .foregroundStyle(.tertiary)
-                    Text("未連線")
-                        .font(.system(size: 12 * uiScale, weight: .medium))
-                        .foregroundStyle(.secondary)
-                } else {
-                    Image(systemName: "terminal")
-                        .font(.system(size: 24))
-                        .foregroundStyle(.tertiary)
-                    Text("尚無工作階段")
-                        .font(.system(size: 12 * uiScale, weight: .medium))
-                        .foregroundStyle(.secondary)
-                    Text("在任何終端機執行 claude 即會出現在這裡")
-                        .font(.system(size: 10 * uiScale))
-                        .foregroundStyle(.tertiary)
-                }
+                Image(systemName: "terminal")
+                    .font(.system(size: 24))
+                    .foregroundStyle(.tertiary)
+                Text("尚無工作階段")
+                    .font(.system(size: 12 * uiScale, weight: .medium))
+                    .foregroundStyle(.secondary)
+                Text("在任何終端機執行 claude 即會出現在這裡")
+                    .font(.system(size: 10 * uiScale))
+                    .foregroundStyle(.tertiary)
                 Spacer()
             }
             .frame(maxWidth: .infinity)
@@ -227,7 +199,7 @@ struct SessionListView: View {
         }
         .contextMenu {
             Button("Forget session") {
-                Task { await model.forgetSession(id: session.id) }
+                model.forgetSession(id: session.id)
             }
         }
     }
@@ -269,7 +241,7 @@ struct SessionListView: View {
         alert.addButton(withTitle: "Forget")
         alert.addButton(withTitle: "Cancel")
         if alert.runModal() == .alertFirstButtonReturn {
-            Task { await model.forgetSession(id: session.id) }
+            model.forgetSession(id: session.id)
         }
     }
 }

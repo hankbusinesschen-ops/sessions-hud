@@ -64,7 +64,7 @@ struct SettingsPopover: View {
 
             let staleCount = model.staleSessions.count
             Button {
-                Task { await model.forgetStale() }
+                model.forgetStale()
             } label: {
                 HStack {
                     Image(systemName: "trash")

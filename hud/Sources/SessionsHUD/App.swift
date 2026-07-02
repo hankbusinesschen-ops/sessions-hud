@@ -47,6 +47,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         true
     }
 
+    func applicationWillTerminate(_ notification: Notification) {
+        model.flushSnapshot()
+    }
+
     private func installMenu() {
         let mainMenu = NSMenu()
 

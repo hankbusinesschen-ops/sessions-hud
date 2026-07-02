@@ -9,5 +9,10 @@ let package = Package(
             name: "SessionsHUD",
             path: "Sources/SessionsHUD"
         ),
+        .testTarget(
+            name: "SessionsHUDTests",
+            dependencies: ["SessionsHUD"],
+            path: "Tests/SessionsHUDTests"
+        ),
     ]
 )
