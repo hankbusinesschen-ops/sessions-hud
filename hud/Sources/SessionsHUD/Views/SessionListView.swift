@@ -20,7 +20,6 @@ struct SessionListView: View {
             content
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(.ultraThinMaterial)
         .background(
             ZStack {
                 Button("") { model.jumpToAttention(forward: true) }
