@@ -7,6 +7,15 @@ enum ConnectionState: Equatable {
     case disconnected
 }
 
+/// Fetch state for `GET /sessions/:id` so Chat view can show missing vs still loading.
+enum SelectedSessionDetailState: Equatable {
+    case idle
+    case loading
+    case ready
+    case missing
+    case failed(String)
+}
+
 @MainActor
 final class AppModel: ObservableObject {
     @Published var sessions: [SessionSummary] = []
@@ -18,16 +27,20 @@ final class AppModel: ObservableObject {
             if selectedId == nil {
                 selectedDetail = nil
                 injectStatus = nil
+                selectedSessionDetailState = .idle
             } else if selectedId != oldValue {
                 selectedDetail = nil
                 injectStatus = nil
-                Task { await refreshSelected() }
+                selectedSessionDetailState = .loading
+                Task { await refreshSelected(silent: false) }
             }
         }
     }
+    @Published var selectedSessionDetailState: SelectedSessionDetailState = .idle
     @Published var selectedDetail: SessionDetail?
     @Published var injectDraft: String = ""
     @Published var injectStatus: String?
+    @Published var runtimeDiagnostics: [RuntimeDiagnostic] = []
 
     private let notifier = Notifier()
     private var clockTimer: Timer?
@@ -91,6 +104,7 @@ final class AppModel: ObservableObject {
         }
         Task { await refresh() }
         Task { await checkHealth() }
+        updateRuntimeDiagnostics()
 
         let client = EventStreamClient(url: endpoint("/events"))
         events = client
@@ -117,13 +131,14 @@ final class AppModel: ObservableObject {
         setConnectionState(.connected)
         await withTaskGroup(of: Void.self) { group in
             group.addTask { [weak self] in await self?.refresh() }
-            group.addTask { [weak self] in await self?.refreshSelected() }
+            group.addTask { [weak self] in await self?.refreshSelected(silent: true) }
         }
     }
 
     private func setConnectionState(_ state: ConnectionState) {
         guard self.connectionState != state else { return }
         self.connectionState = state
+        updateRuntimeDiagnostics()
     }
 
     private func checkHealth() async {
@@ -146,14 +161,14 @@ final class AppModel: ObservableObject {
             await withTaskGroup(of: Void.self) { group in
                 group.addTask { [weak self] in await self?.refresh() }
                 if selectedId != nil {
-                    group.addTask { [weak self] in await self?.refreshSelected() }
+                    group.addTask { [weak self] in await self?.refreshSelected(silent: true) }
                 }
             }
         case .sessionUpdated(let id):
             await withTaskGroup(of: Void.self) { group in
                 group.addTask { [weak self] in await self?.refresh() }
                 if id == selectedId {
-                    group.addTask { [weak self] in await self?.refreshSelected() }
+                    group.addTask { [weak self] in await self?.refreshSelected(silent: true) }
                 }
             }
         case .unknown:
@@ -177,6 +192,10 @@ final class AppModel: ObservableObject {
                 }
             if self.sessions != list {
                 self.sessions = list
+            }
+            if let sid = self.selectedId, !list.contains(where: { $0.id == sid }) {
+                self.selectedDetail = nil
+                self.selectedSessionDetailState = .missing
             }
             self.notifier.observe(list)
             self.lastError = nil
@@ -221,27 +240,69 @@ final class AppModel: ObservableObject {
     /// Fetch the full session payload for the currently selected id so Mode B
     /// can render the message history. Called on selection change and on each
     /// poll tick while a row remains selected.
-    func refreshSelected() async {
+    func refreshSelected(silent: Bool = false) async {
         guard let id = selectedId else { return }
+        if !silent {
+            selectedSessionDetailState = .loading
+        }
         do {
             var req = URLRequest(url: endpoint("/sessions/\(id)"))
             req.timeoutInterval = 2
             let (data, resp) = try await URLSession.shared.data(for: req)
+            guard selectedId == id else { return }
             if let http = resp as? HTTPURLResponse, http.statusCode == 404 {
-                // session disappeared — drop the detail but keep the selection
-                // so the view can show a placeholder.
                 self.selectedDetail = nil
+                self.selectedSessionDetailState = .missing
                 return
             }
             let detail = try decoder.decode(SessionDetail.self, from: data)
-            if self.selectedDetail != detail {
-                self.selectedDetail = detail
-            }
+            guard selectedId == id else { return }
+            self.selectedDetail = detail
+            self.selectedSessionDetailState = .ready
+            self.injectStatus = nil
         } catch {
-            // Leave selectedDetail as-is; surface via injectStatus to avoid
-            // stomping daemon-list error.
+            guard selectedId == id else { return }
+            self.selectedDetail = nil
+            self.selectedSessionDetailState = .failed(error.localizedDescription)
             self.injectStatus = "detail: \(error.localizedDescription)"
         }
+    }
+
+    /// Recompute local + daemon diagnostic rows (hooks, statusline, PATH, 39501).
+    func updateRuntimeDiagnostics() {
+        var items: [RuntimeDiagnostic] = []
+        let (daemonOk, daemonDetail): (Bool, String) = {
+            switch connectionState {
+            case .connected:
+                return (true, "HTTP /health 正常")
+            case .connecting:
+                return (true, "連線中…")
+            case .disconnected:
+                return (false, "未連線 — 確認 launchd 或執行 scripts/check-sessions-hud-runtime.sh")
+            }
+        }()
+        items.append(
+            RuntimeDiagnostic(
+                id: "daemon",
+                ok: daemonOk,
+                label: "sessionsd (39501)",
+                detail: daemonDetail
+            )
+        )
+        items.append(contentsOf: RuntimeDiagnostics.gatherFileBasedChecks())
+        if runtimeDiagnostics != items {
+            runtimeDiagnostics = items
+        }
+    }
+
+    /// Send Ctrl+C (ETX) to the wrapper PTY (interrupt running tool / TUI).
+    func sendInterrupt(sessionId: String) async {
+        await injectInput(sessionId: sessionId, text: "\u{3}")
+    }
+
+    /// Send a bare Enter (e.g. confirm empty prompt, continue in some TUI states).
+    func sendEnter(sessionId: String) async {
+        await injectInput(sessionId: sessionId, text: "\r")
     }
 
     /// POST the given text to `/sessions/<id>/input`. On success, the daemon

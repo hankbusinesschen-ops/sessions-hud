@@ -11,16 +11,13 @@ DAEMON_URL="${SESSIONSD_URL:-http://127.0.0.1:39501}"
 # Drain stdin into a variable so we can pass it to curl with a short timeout.
 PAYLOAD="$(cat)"
 
-# Debug: dump Notification payloads so we can answer "can we tell permission
-# requests apart from other notifications?" (risk #5 in the design doc).
-# Remove once we know the answer.
-if [ "$EVENT" = "Notification" ]; then
-    DEBUG_LOG="${SESSIONSD_DEBUG_LOG:-/tmp/sessionsd-notification.log}"
+# Optional debug: set SESSIONSD_DEBUG_LOG to a file path to append Notification payloads.
+if [ "$EVENT" = "Notification" ] && [ -n "${SESSIONSD_DEBUG_LOG:-}" ]; then
     {
         echo "--- $(date -Iseconds) ---"
         echo "$PAYLOAD"
         echo
-    } >> "$DEBUG_LOG" 2>/dev/null || true
+    } >> "${SESSIONSD_DEBUG_LOG}" 2>/dev/null || true
 fi
 
 # If we were spawned under a `cc` PTY wrapper, propagate its id so the

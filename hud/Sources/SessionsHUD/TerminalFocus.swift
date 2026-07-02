@@ -6,10 +6,11 @@ import Foundation
 /// register time — this is the only identifier that uniquely survives tab
 /// reordering and window moves in both Terminal.app and iTerm2.
 enum TerminalFocus {
-    static func openInTerminal(tty: String?, termProgram: String?) {
+    /// Returns `nil` on success; a short user-facing message on failure.
+    @discardableResult
+    static func openInTerminal(tty: String?, termProgram: String?) -> String? {
         guard let tty, !tty.isEmpty else {
-            NSSound.beep()
-            return
+            return "沒有 tty 資訊，無法在終端聚焦（多為 native claude 或非 ccw session）"
         }
         let script: String
         switch termProgram {
@@ -21,16 +22,10 @@ enum TerminalFocus {
             // Unknown terminal — try Terminal.app as a best-effort fallback.
             script = terminalAppScript(tty: tty)
         }
-        run(script)
-    }
-
-    private static func run(_ source: String) {
-        var err: NSDictionary?
-        let applescript = NSAppleScript(source: source)
-        applescript?.executeAndReturnError(&err)
-        if let err {
-            NSLog("TerminalFocus: osascript failed: \(err)")
+        if let err = runReturningError(script) {
+            return "無法在終端聚焦：\(err)。請檢查系統設定 → 隱私權 → 自動化（Terminal / iTerm）"
         }
+        return nil
     }
 
     private static func terminalAppScript(tty: String) -> String {

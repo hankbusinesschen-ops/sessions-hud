@@ -60,13 +60,19 @@ struct CompactListView: View {
     }
 
     private var disconnectedBanner: some View {
-        HStack(spacing: 4) {
-            Image(systemName: "exclamationmark.triangle.fill")
-                .font(.system(size: 10))
-                .foregroundStyle(.orange)
-            Text("sessionsd 未連線")
-                .font(.system(size: 10 * uiScale))
-                .foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 4) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.orange)
+                Text("sessionsd 未連線")
+                    .font(.system(size: 10 * uiScale))
+                    .foregroundStyle(.secondary)
+            }
+            Text("終端可執行專案內 `scripts/check-sessions-hud-runtime.sh` 檢查 daemon / hooks。README → Troubleshooting。")
+                .font(.system(size: 9 * uiScale))
+                .foregroundStyle(.tertiary)
+                .lineLimit(3)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 4)
@@ -446,6 +452,7 @@ struct SessionRow: View {
                             .font(.system(size: 12 * uiScale, weight: .medium))
                             .lineLimit(1)
                             .truncationMode(.middle)
+                        operabilityPill
                         Spacer(minLength: 4)
                         Text(rightLabel)
                             .font(.system(size: 10 * uiScale, design: .monospaced))
@@ -465,22 +472,6 @@ struct SessionRow: View {
                                 .layoutPriority(1)
                         }
                         Spacer(minLength: 4)
-                        if session.wrapperId != nil {
-                            Image(systemName: "link")
-                                .font(.system(size: 9))
-                                .foregroundStyle(.tertiary)
-                                .help("injectable — launched via ccw/cxw")
-                        } else {
-                            Text("RO")
-                                .font(.system(size: 8 * uiScale, weight: .semibold))
-                                .foregroundStyle(.orange)
-                                .padding(.horizontal, 3)
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 3)
-                                        .stroke(Color.orange.opacity(0.6), lineWidth: 1)
-                                )
-                                .help("read-only — native claude, approvals disabled")
-                        }
                     }
                 }
                 if let onClose {
@@ -500,6 +491,19 @@ struct SessionRow: View {
             .padding(.vertical, 6)
         }
         .background(rowBackground)
+    }
+
+    private var operabilityPill: some View {
+        Text(session.wrapperId == nil ? "唯讀" : "可注入")
+            .font(.system(size: 8 * uiScale, weight: .bold))
+            .foregroundStyle(session.wrapperId == nil ? Color.orange : Color.green)
+            .padding(.horizontal, 5)
+            .padding(.vertical, 1)
+            .background((session.wrapperId == nil ? Color.orange : Color.green).opacity(0.14))
+            .clipShape(Capsule())
+            .help(session.wrapperId == nil
+                ? "唯讀：原生 claude，HUD 無法注入"
+                : "可注入：ccw/cxw，HUD 可核准與注入")
     }
 
     private var rowBackground: Color {
@@ -711,9 +715,20 @@ struct ChatView: View {
             }
 
             VStack(alignment: .leading, spacing: 1) {
-                Text(selectedSummary?.name ?? model.selectedId ?? "")
-                    .font(.system(size: 13 * uiScale, weight: .semibold))
-                    .lineLimit(1)
+                HStack(spacing: 6) {
+                    Text(selectedSummary?.name ?? model.selectedId ?? "")
+                        .font(.system(size: 13 * uiScale, weight: .semibold))
+                        .lineLimit(1)
+                    if let s = selectedSummary {
+                        Text(s.wrapperId == nil ? "唯讀" : "可注入")
+                            .font(.system(size: 8 * uiScale, weight: .bold))
+                            .foregroundStyle(s.wrapperId == nil ? Color.orange : Color.green)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1)
+                            .background((s.wrapperId == nil ? Color.orange : Color.green).opacity(0.14))
+                            .clipShape(Capsule())
+                    }
+                }
                 if let cwd = selectedSummary?.cwd {
                     Text(cwd)
                         .font(.system(size: 10 * uiScale))
@@ -735,17 +750,20 @@ struct ChatView: View {
             }
 
             Button {
-                TerminalFocus.openInTerminal(
+                if let err = TerminalFocus.openInTerminal(
                     tty: model.selectedDetail?.tty,
                     termProgram: model.selectedDetail?.termProgram
-                )
+                ) {
+                    model.injectStatus = err
+                } else {
+                    model.injectStatus = nil
+                }
             } label: {
                 Image(systemName: "arrow.up.right.square")
                     .font(.system(size: 13))
                     .foregroundStyle(.secondary)
             }
             .buttonStyle(.plain)
-            .disabled((model.selectedDetail?.tty ?? "").isEmpty)
             .help("Open in terminal")
 
             Button {
@@ -789,38 +807,90 @@ struct ChatView: View {
 
     @ViewBuilder
     private var messageList: some View {
-        if let detail = model.selectedDetail {
-            if detail.messages.isEmpty {
-                emptyState("no messages yet")
+        switch model.selectedSessionDetailState {
+        case .missing:
+            missingOrFailedView(
+                title: "此工作階段已從清單移除",
+                body: "可能已結束、被掃除，或 sessionsd 重啟。請回到清單選擇其他 session。",
+                isError: false
+            )
+        case .failed(let msg):
+            missingOrFailedView(
+                title: "無法載入內容",
+                body: msg,
+                isError: true
+            )
+        case .loading, .idle:
+            if let detail = model.selectedDetail, !detail.messages.isEmpty {
+                // Silent refresh: keep showing previous messages while refetching.
+                messageScrollView(detail: detail)
             } else {
-                ScrollViewReader { proxy in
-                    ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 10) {
-                            ForEach(detail.messages) { msg in
-                                MessageBubble(message: msg)
-                                    .id(msg.id)
-                            }
-                            // Anchor at the bottom so we can scrollTo() after updates.
-                            Color.clear
-                                .frame(height: 1)
-                                .id("__bottom__")
-                        }
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 12)
+                emptyState("載入中…")
+            }
+        case .ready:
+            if let detail = model.selectedDetail {
+                if detail.messages.isEmpty {
+                    emptyState("no messages yet")
+                } else {
+                    messageScrollView(detail: detail)
+                }
+            } else {
+                emptyState("載入中…")
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func messageScrollView(detail: SessionDetail) -> some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 10) {
+                    ForEach(detail.messages) { msg in
+                        MessageBubble(message: msg)
+                            .id(msg.id)
                     }
-                    .onChange(of: detail.messages.count) { _ in
-                        withAnimation(.easeOut(duration: 0.15)) {
-                            proxy.scrollTo("__bottom__", anchor: .bottom)
-                        }
-                    }
-                    .onAppear {
-                        proxy.scrollTo("__bottom__", anchor: .bottom)
-                    }
+                    Color.clear
+                        .frame(height: 1)
+                        .id("__bottom__")
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 12)
+            }
+            .onChange(of: detail.messages.count) { _ in
+                withAnimation(.easeOut(duration: 0.15)) {
+                    proxy.scrollTo("__bottom__", anchor: .bottom)
                 }
             }
-        } else {
-            emptyState("loading…")
+            .onAppear {
+                proxy.scrollTo("__bottom__", anchor: .bottom)
+            }
         }
+    }
+
+    @ViewBuilder
+    private func missingOrFailedView(title: String, body: String, isError: Bool) -> some View {
+        VStack(spacing: 12) {
+            Spacer()
+            Text(title)
+                .font(.system(size: 12 * uiScale, weight: .semibold))
+            Text(body)
+                .font(.system(size: 10 * uiScale))
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 20)
+            if isError {
+                Button("重試") {
+                    Task { await model.refreshSelected(silent: false) }
+                }
+                .controlSize(.small)
+            }
+            Button("回清單") {
+                model.selectedId = nil
+            }
+            .controlSize(.small)
+            Spacer()
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private func emptyState(_ text: String) -> some View {
@@ -846,10 +916,10 @@ struct ChatView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text("Read-only session")
                     .font(.system(size: 11 * uiScale, weight: .semibold))
-                Text("Native claude — approvals and input disabled. Relaunch via ccw to enable them.")
+                Text("以原生 claude 啟動、未經 ccw 註冊到 PTY。HUD 可監看，但核准與注入停用。使用 `ccw 名稱` 在專案目錄重開，或按下方在終端用 ccw 重啟一個可注入的 session。")
                     .font(.system(size: 10 * uiScale))
                     .foregroundStyle(.secondary)
-                    .lineLimit(2)
+                    .lineLimit(4)
             }
             Spacer()
             Button("Relaunch as ccw") {
@@ -867,7 +937,24 @@ struct ChatView: View {
 
     @ViewBuilder
     private var injectBar: some View {
-        VStack(alignment: .leading, spacing: 2) {
+        VStack(alignment: .leading, spacing: 6) {
+            if canInject, let sid = model.selectedId {
+                HStack(spacing: 6) {
+                    Button("Interrupt (⌃C)") {
+                        Task { await model.sendInterrupt(sessionId: sid) }
+                    }
+                    .font(.system(size: 10 * uiScale))
+                    .help("Sends ETX to the ccw PTY (interrupt in Claude Code TUI)")
+
+                    Button("Enter ⏎") {
+                        Task { await model.sendEnter(sessionId: sid) }
+                    }
+                    .font(.system(size: 10 * uiScale))
+                    .help("Sends a bare newline")
+
+                    Spacer()
+                }
+            }
             HStack(spacing: 6) {
                 TextField("type a reply…", text: $model.injectDraft, onCommit: send)
                     .textFieldStyle(.roundedBorder)
@@ -878,7 +965,7 @@ struct ChatView: View {
                     .disabled(!canInject || model.injectDraft.isEmpty || model.selectedId == nil)
             }
             if !canInject {
-                Text("read-only — launch this session via ccw to enable input")
+                Text("read-only — 請用 `ccw <name>` 在終端啟動 claude 才能從此處注入")
                     .font(.system(size: 10 * uiScale))
                     .foregroundStyle(.tertiary)
             }
@@ -1092,11 +1179,28 @@ struct PromptBanner: View {
 
     @ViewBuilder
     private func rawView(message: String) -> some View {
-        HStack(alignment: .top, spacing: 6) {
-            Text("❓")
-            Text(message.isEmpty ? "Claude is waiting for input" : message)
-                .font(.system(size: 12 * uiScale))
-                .fixedSize(horizontal: false, vertical: true)
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top, spacing: 6) {
+                Text("❓")
+                Text(message.isEmpty ? "Claude is waiting for input" : message)
+                    .font(.system(size: 12 * uiScale))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if canInject {
+                HStack(spacing: 6) {
+                    Button("Interrupt (⌃C)") {
+                        Task { await model.sendInterrupt(sessionId: sessionId) }
+                    }
+                    .font(.system(size: 10 * uiScale))
+                    Button("Enter ⏎") {
+                        Task { await model.sendEnter(sessionId: sessionId) }
+                    }
+                    .font(.system(size: 10 * uiScale))
+                    Button("1") { respond(1) }
+                    Button("2") { respond(2) }
+                    Button("3") { respond(3) }
+                }
+            }
         }
     }
 
@@ -1145,7 +1249,12 @@ struct QuestionView: View {
                     .disabled(!canInject)
                 Button("Submit") { submit() }
                     .font(.system(size: 11 * uiScale))
-                    .disabled(!canInject || (selected.isEmpty && freeText.isEmpty))
+                    .disabled(!canInject || (selected.isEmpty && freeText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty))
+            }
+            if !question.multiSelect {
+                Text("單選：先點選選項，再按 Submit 送出。")
+                    .font(.system(size: 9 * uiScale))
+                    .foregroundStyle(.tertiary)
             }
         }
     }
@@ -1197,15 +1306,8 @@ struct QuestionView: View {
                 selected.insert(label)
             }
         } else {
-            // Single-select: one tap sends immediately.
+            // Single-select: pick first, then Submit (avoids mis-tap sends).
             selected = [label]
-            Task {
-                await model.answerQuestion(id: sessionId, selections: [label])
-                await MainActor.run {
-                    self.selected.removeAll()
-                    self.freeText = ""
-                }
-            }
         }
     }
 
@@ -1476,6 +1578,40 @@ struct SettingsPopover: View {
 
             Divider()
 
+            HStack {
+                Text("診斷 / Diagnostics")
+                    .font(.system(size: 12, weight: .semibold))
+                Spacer()
+                Button("重新檢查") {
+                    model.updateRuntimeDiagnostics()
+                }
+                .font(.system(size: 10))
+                .buttonStyle(.borderless)
+            }
+            VStack(alignment: .leading, spacing: 6) {
+                ForEach(model.runtimeDiagnostics) { row in
+                    HStack(alignment: .top, spacing: 6) {
+                        Image(systemName: row.ok ? "checkmark.circle.fill" : "xmark.circle.fill")
+                            .font(.system(size: 11))
+                            .foregroundStyle(row.ok ? .green : .red)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(row.label)
+                                .font(.system(size: 11, weight: .medium))
+                            Text(row.detail)
+                                .font(.system(size: 9))
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                }
+            }
+            Text("終端可執行專案內 `scripts/check-sessions-hud-runtime.sh` 得到完整腳本檢查。")
+                .font(.system(size: 9))
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Divider()
+
             let staleCount = model.staleNativeSessions.count
             Button {
                 Task { await model.forgetStaleNative() }
@@ -1503,6 +1639,7 @@ struct SettingsPopover: View {
             }
         }
         .padding(14)
-        .frame(width: 260)
+        .frame(width: 300)
+        .onAppear { model.updateRuntimeDiagnostics() }
     }
 }

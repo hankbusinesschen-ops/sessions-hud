@@ -8,10 +8,7 @@
 ![Status: experimental](https://img.shields.io/badge/status-experimental-orange)
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
 
-<!-- TODO: record docs/media/hero.gif (20s: open HUD → approve permission → + button launch → new session appears) -->
-<p align="center">
-  <img src="docs/media/hero.gif" alt="Sessions HUD demo" width="640"/>
-</p>
+<!-- Screen recording: add docs/media/hero.gif and uncomment the image tag. -->
 
 ## What it is
 
@@ -37,13 +34,23 @@ a new session, you click `+`.
 - **Spawn new sessions** from the HUD — pick a recent project root, pick a permission mode (default / plan / auto edits / yolo), click Launch
 - Works with native `claude` / `codex` CLIs **and** with the optional `ccw` / `cxw` PTY wrappers. Wrapper-backed sessions are injectable (you can answer prompts and send free text); native sessions are read-only
 
+### When is a session read-only vs injectable?
+
+| How you started | In HUD list? | Approve / inject from HUD? |
+|-------------------|--------------|----------------------------|
+| Native `claude` / `codex` (no wrapper) | Yes — via Claude Code hooks | **No** — watch-only; use **Relaunch as ccw** or start `ccw <name>` in that repo |
+| `ccw <name>` / `cxw <name>` / HUD `+` launcher | Yes | **Yes** — wrapper registers a PTY + unix socket; HUD posts to `/sessions/:id/input` |
+| `ccw` but `sessionsd` is down | Row may be missing or wrapper unattached | Injection needs a healthy daemon on `127.0.0.1:39501` |
+
+You need **three** things for a good “live + clickable” experience: **`sessionsd` running**, **Claude Code hooks** (so prompts, Stop, and transcript show up), and a **wrapper-backed** session for injection. Run [`scripts/check-sessions-hud-runtime.sh`](scripts/check-sessions-hud-runtime.sh) to verify binaries, health, hooks, and statusline — see [`docs/runtime-check.md`](docs/runtime-check.md).
+
+### `ccw` wrapper defaults
+
+The `ccw` binary wraps `claude` in a PTY and registers with `sessionsd`. By default it also passes `--dangerously-skip-permissions` to match a common local workflow (see `crates/cc/src/lib.rs`). To disable that behavior: set `CC_NO_SKIP_PERMISSIONS=1` or pass your own flags after `--`. This is separate from the HUD **launcher** permission modes (default / plan / auto edits / yolo).
+
 ## How it looks
 
-<!-- TODO: capture three screenshots into docs/media/ -->
-
-| Compact list | Chat view | Launcher |
-|:---:|:---:|:---:|
-| ![list](docs/media/list.png) | ![chat](docs/media/chat.png) | ![launcher](docs/media/launcher.png) |
+Screenshots live in `docs/media/` when checked in. Until then, run the app and use **Mode A** (compact list) and **Mode B** (chat), or the **`+` launcher** popover.
 
 ## Requirements
 
@@ -122,8 +129,11 @@ Mode B.
 ### Chat view (Mode B)
 
 Full message history for the selected session. When the session is waiting
-on you, an approval banner appears above the input. Type into the input
-box and hit Enter to inject free text (wrapper-backed sessions only).
+on you, an approval banner appears above the input. For **wrapper-backed**
+sessions, use **Interrupt (⌃C)** and **Enter ⏎** for quick TUI control, type
+into the input box and **Send** for free text, and use the approval / question
+buttons when shown. Native (read-only) sessions show a lock banner — start
+`ccw` to enable controls.
 
 ### The `+` launcher
 
@@ -159,36 +169,49 @@ box and hit Enter to inject free text (wrapper-backed sessions only).
          /hook/SessionStart         │   port 39501) │
          /hook/UserPromptSubmit     └───────┬───────┘
          /hook/Notification                 │
-         /hook/Stop                         │ HTTP poll (1s)
-         /hook/statusline                   │
+         /hook/Stop                         │ Server-Sent Events
+         /hook/statusline                   │ GET /events (+ JSONL
+         transcript tail ~500ms            │  cache invalidation)
+                 │                          │
+                 │                          ▼
                                     ┌───────▼──────┐
                                     │  sessions-   │
                                     │  hud (Swift) │
+                                    │  refetch     │
+                                    │  /sessions   │
                                     └──────────────┘
 ```
 
 Three components:
 
 - **`ccw` / `cxw`** — portable-pty wrappers that own the real `claude` / `codex` child process. They register with the daemon on startup and expose a unix socket the daemon can write keystrokes into.
-- **`sessionsd`** — a small axum HTTP server on `127.0.0.1:39501`. It aggregates wrapper registrations, Claude Code hook events, and statusline JSON into a single in-memory session registry, and forwards input from the HUD back to the appropriate wrapper socket.
-- **`sessions-hud`** — a SwiftUI app that polls the daemon once per second, renders the compact list and chat views, and POSTs input / approval responses.
+- **`sessionsd`** — a small axum HTTP server on `127.0.0.1:39501`. It aggregates wrapper registrations, Claude Code hook events, and statusline JSON into a single in-memory session registry, tails each session’s JSONL transcript (periodic, ~500 ms), and forwards input from the HUD back to the appropriate wrapper socket.
+- **`sessions-hud`** — a SwiftUI app that subscribes to `/events` (SSE) for change notifications, refetches `GET /sessions` and `GET /sessions/:id` when sessions update, and POSTs to `/sessions/:id/input` for approvals and free text. A 10 s `/health` poll and SSE reconnect keep the connection honest after sleep/wake. (Settings also shows a local **Diagnostics** panel: hooks, statusline tee, `ccw` in `PATH`, daemon reachability.)
 
 ## Troubleshooting
 
-**HUD is empty / no sessions show up.** Check that the daemon is running
-and the hooks are wired up:
+From the repo root, run:
 
 ```bash
-launchctl list | grep sessionsd
-curl http://127.0.0.1:39501/health
-grep sessionsd ~/.claude/settings.json
+./scripts/check-sessions-hud-runtime.sh
+```
+
+**HUD is empty / no sessions show up.** Prefer `./scripts/check-sessions-hud-runtime.sh`, then:
+
+```bash
+launchctl list | grep com.sessionshud
+curl -fsS http://127.0.0.1:39501/health
+grep -q post-event.sh ~/.claude/settings.json && echo "hooks OK"
 ```
 
 **`+` → Launch does nothing.** Automation permission. Check System Settings
 → Privacy & Security → Automation → Sessions HUD.
 
-**`ctx% / 5h% / 7d%` rows never appear.** The statusline tee block isn't
-installed. See post-install step 3.
+**`ctx% / 5h% / 7d%` rows never appear.** You need a custom
+`~/.claude/statusline-command.sh` for the installer to patch; then
+`packaging/patch-statusline.sh` (or re-run `./install.sh`) adds the tee to
+`sessionsd`. Without a custom statusline file, the HUD has no way to read
+Claude’s quota JSON.
 
 **Approval buttons are greyed out.** That session was launched with native
 `claude`, not `ccw`. Native sessions are read-only — re-launch via `ccw
@@ -208,7 +231,7 @@ launchctl kickstart -k gui/$UID/com.sessionshud.daemon
 ## Safety
 
 - The `yolo` permission mode passes `--permission-mode bypassPermissions` to claude. It **skips all tool permission prompts**. Only use it in disposable repos or sandboxes.
-- The daemon listens on `127.0.0.1` only — loopback, not network. Any process on your machine running as your uid can POST to it. Don't run this on a shared user account.
+- The daemon listens on `127.0.0.1` only — loopback, not network. **Any process on your machine running as your uid** can `POST` to `POST /sessions/:id/input` (inject keystrokes) or `POST /sessions/:id/terminate` (SIGTERM) if it knows a session id. The debug-only `POST /wrappers/:id/input` route is **disabled by default**; set `SESSIONSD_ENABLE_WRAPPER_INPUT=1` before starting `sessionsd` if you need it for E2E. Don't run this on a shared user account.
 - `ccw` / `cxw` sit between your terminal and the real CLI. Every keystroke and every byte of output passes through the wrapper. Read the source (`crates/cc/src/`) if you care.
 
 ## Development
@@ -221,6 +244,8 @@ cargo test --workspace
 # Swift side
 cd hud && swift build
 ```
+
+Manual E2E checklist after feature work: [`docs/verification-checklist.md`](docs/verification-checklist.md).
 
 Layout:
 

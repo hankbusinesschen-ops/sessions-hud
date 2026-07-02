@@ -942,6 +942,13 @@ async fn inject_by_wrapper(
     State(state): State<AppState>,
     Json(req): Json<InjectRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    if std::env::var("SESSIONSD_ENABLE_WRAPPER_INPUT").ok().as_deref() != Some("1") {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "POST /wrappers/:id/input is disabled (set SESSIONSD_ENABLE_WRAPPER_INPUT=1 to enable for E2E)"
+                .into(),
+        ));
+    }
     let socket_path = {
         let wrappers = state.wrappers.read();
         wrappers
@@ -1167,8 +1174,12 @@ async fn read_new_lines(
 
     let had_update = new_pos != bytes_read || !new_messages.is_empty() || !new_events.is_empty();
     if had_update {
+        let now = Utc::now();
         let mut reg = registry.write();
         if let Some(s) = reg.get_mut(session_id) {
+            // Transcript appends are live activity: keep `last_event_at` fresh so
+            // `GET /sessions` sort matches what the user sees (not only hook events).
+            s.last_event_at = now;
             s.bytes_read = new_pos;
             s.messages.extend(new_messages);
             if s.messages.len() > MAX_MESSAGES_PER_SESSION {
